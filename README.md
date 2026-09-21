@@ -8,9 +8,9 @@ was created solely because i wanted a single header scripting language and the l
 ## table of contents
 
 - [features](#features)
-- [using as lib] (#lib usage)
-- [building from source](#building from source)
-- [release (cli interpreter) usage](#cli usage)
+- [using as lib] (#lib)
+- [building from source](#building)
+- [release (cli interpreter) usage](#cli)
 - [configuration](#configuration)
 - [contributing](#contributing)
 - [faq](#faq)
@@ -27,7 +27,7 @@ was created solely because i wanted a single header scripting language and the l
 - first class functions and closures with full upvalue capture
 - number, string, array, map, callable, pointer data types
 
-## lib usage
+## lib
 
 a simple `#include "embr.h"` in your C++ script is all you need to access everything. run embr code with
 ```cpp
@@ -56,7 +56,7 @@ inline void runSource(const std::string& src, Interpreter& interp,
 ```
 you can store the program, inspect the AST, or call `runner.invoke()` directly
 
-## building from source
+## building
 ```bash
 git clone --recurse-submodules https://github.com/la-cretura/embr.git
 cd embr
@@ -72,7 +72,7 @@ cmake --build --preset windows-release
 #### macos
 you're on your own here i dont have a mac to test it on ¯\\_(ツ)_/¯ tell me if you figure something out
 
-## cli usage
+## cli
 
 ```bash
 ./embr myscript.embr
@@ -95,7 +95,7 @@ contributions are welcome. follow these steps:
 
 ## faq
 
-#### does it support macos
+#### does it support XYZ
 
 ¯\\_(ツ)_/¯
 only tested on linux mint 22.3 64 bit and windows 10 64 bit
