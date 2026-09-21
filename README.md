@@ -8,7 +8,7 @@ was created solely because i wanted a single header scripting language and the l
 ## table of contents
 
 - [features](#features)
-- [using as lib] (#lib)
+- [using as lib](#lib)
 - [building from source](#building)
 - [release (cli interpreter) usage](#cli)
 - [configuration](#configuration)
