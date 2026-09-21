@@ -1,43 +1,8 @@
-# Prerequisites
-*.d
-
 # Compiled Object files
 *.slo
 *.lo
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
 
 # Build directories
 build/
@@ -51,10 +16,8 @@ cmake_install.cmake
 Makefile
 install_manifest.txt
 compile_commands.json
-
 CMakeLists.txt.user
 CMakeScripts
-Testing
 CTestTestfile.cmake
 _deps
 
@@ -63,12 +26,6 @@ _deps
 *.log
 *.bak
 *.swp
-
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
 
 # test output & cache
 Testing/
