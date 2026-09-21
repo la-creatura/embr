@@ -1,0 +1,1 @@
+/usr/bin/g++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,embrlib.so -o "/home/alice/Desktop/embr cmake/bin/linux/plugins/embrlib.so" CMakeFiles/embrlib.dir/embrlib/embrlib.cpp.o 

@@ -1,0 +1,57 @@
+{
+    "version": 6,
+
+    "configurePresets": [
+
+        {
+            "name": "linux-debug",
+            "generator": "Unix Makefiles",
+            "binaryDir": "build/linux-debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_TOOLCHAIN_FILE": "cmake/linux-gcc.cmake"
+            }
+        },
+
+        {
+            "name": "linux-release",
+            "generator": "Unix Makefiles",
+            "binaryDir": "build/linux-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_TOOLCHAIN_FILE": "cmake/linux-gcc.cmake"
+            }
+        },
+
+        {
+            "name": "windows-release",
+            "generator": "Unix Makefiles",
+            "binaryDir": "build/windows-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_TOOLCHAIN_FILE": "cmake/mingw-w64.cmake"
+            }
+        }
+    ],
+
+    "buildPresets": [
+
+        {
+            "name": "linux-debug",
+            "configurePreset": "linux-debug",
+            "jobs": 0
+        },
+
+        {
+            "name": "linux-release",
+            "configurePreset": "linux-release",
+            "jobs": 0
+        },
+
+        {
+            "name": "windows-release",
+            "configurePreset": "windows-release",
+            "jobs": 0
+        }
+    ]
+}

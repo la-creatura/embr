@@ -1,0 +1,3 @@
+/usr/bin/cmake -E rm -f CMakeFiles/embrffi.dir/objects.a
+/usr/bin/x86_64-w64-mingw32-ar qc CMakeFiles/embrffi.dir/objects.a @CMakeFiles/embrffi.dir/objects1.rsp
+/usr/bin/x86_64-w64-mingw32-g++ -O3 -DNDEBUG -shared -o "/home/alice/Desktop/embr cmake/bin/windows/plugins/embrffi.dll" -Wl,--out-implib,libembrffi.dll.a -Wl,--major-image-version,0,--minor-image-version,0 -Wl,--whole-archive CMakeFiles/embrffi.dir/objects.a -Wl,--no-whole-archive @CMakeFiles/embrffi.dir/linkLibs.rsp

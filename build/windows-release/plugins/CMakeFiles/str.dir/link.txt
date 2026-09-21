@@ -1,0 +1,3 @@
+/usr/bin/cmake -E rm -f CMakeFiles/str.dir/objects.a
+/usr/bin/x86_64-w64-mingw32-ar qc CMakeFiles/str.dir/objects.a @CMakeFiles/str.dir/objects1.rsp
+/usr/bin/x86_64-w64-mingw32-g++ -O3 -DNDEBUG -shared -o "/home/alice/Desktop/embr cmake/bin/windows/plugins/str.dll" -Wl,--out-implib,libstr.dll.a -Wl,--major-image-version,0,--minor-image-version,0 -Wl,--whole-archive CMakeFiles/str.dir/objects.a -Wl,--no-whole-archive @CMakeFiles/str.dir/linkLibs.rsp

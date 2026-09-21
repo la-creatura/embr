@@ -1,0 +1,9 @@
+/home/alice/Desktop/embr cmake/build/windows-release/CMakeFiles/embr.dir
+/home/alice/Desktop/embr cmake/build/windows-release/CMakeFiles/embr_tests.dir
+/home/alice/Desktop/embr cmake/build/windows-release/CMakeFiles/edit_cache.dir
+/home/alice/Desktop/embr cmake/build/windows-release/CMakeFiles/rebuild_cache.dir
+/home/alice/Desktop/embr cmake/build/windows-release/plugins/CMakeFiles/embrlib.dir
+/home/alice/Desktop/embr cmake/build/windows-release/plugins/CMakeFiles/str.dir
+/home/alice/Desktop/embr cmake/build/windows-release/plugins/CMakeFiles/embrffi.dir
+/home/alice/Desktop/embr cmake/build/windows-release/plugins/CMakeFiles/edit_cache.dir
+/home/alice/Desktop/embr cmake/build/windows-release/plugins/CMakeFiles/rebuild_cache.dir
