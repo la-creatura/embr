@@ -1,3 +1,0 @@
-/usr/bin/cmake -E rm -f CMakeFiles/embr_tests.dir/objects.a
-/usr/bin/x86_64-w64-mingw32-ar qc CMakeFiles/embr_tests.dir/objects.a @CMakeFiles/embr_tests.dir/objects1.rsp
-/usr/bin/x86_64-w64-mingw32-g++ -O3 -DNDEBUG -Wl,--whole-archive CMakeFiles/embr_tests.dir/objects.a -Wl,--no-whole-archive -o "/home/alice/Desktop/embr cmake/bin/windows/embr_tests.exe" -Wl,--out-implib,libembr_tests.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles/embr_tests.dir/linkLibs.rsp

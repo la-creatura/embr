@@ -1,1 +1,0 @@
-/usr/bin/g++ -O3 -DNDEBUG CMakeFiles/embr.dir/src/cli.cpp.o -o "/home/alice/Desktop/embr cmake/bin/linux/embr" 

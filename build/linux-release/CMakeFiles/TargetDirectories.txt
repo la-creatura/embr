@@ -1,9 +1,0 @@
-/home/alice/Desktop/embr cmake/build/linux-release/CMakeFiles/embr.dir
-/home/alice/Desktop/embr cmake/build/linux-release/CMakeFiles/embr_tests.dir
-/home/alice/Desktop/embr cmake/build/linux-release/CMakeFiles/edit_cache.dir
-/home/alice/Desktop/embr cmake/build/linux-release/CMakeFiles/rebuild_cache.dir
-/home/alice/Desktop/embr cmake/build/linux-release/plugins/CMakeFiles/embrlib.dir
-/home/alice/Desktop/embr cmake/build/linux-release/plugins/CMakeFiles/str.dir
-/home/alice/Desktop/embr cmake/build/linux-release/plugins/CMakeFiles/embrffi.dir
-/home/alice/Desktop/embr cmake/build/linux-release/plugins/CMakeFiles/edit_cache.dir
-/home/alice/Desktop/embr cmake/build/linux-release/plugins/CMakeFiles/rebuild_cache.dir

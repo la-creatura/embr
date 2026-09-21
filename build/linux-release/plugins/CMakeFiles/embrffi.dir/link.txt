@@ -1,1 +1,0 @@
-/usr/bin/g++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,embrffi.so -o "/home/alice/Desktop/embr cmake/bin/linux/plugins/embrffi.so" CMakeFiles/embrffi.dir/embrffi/embrffi.cpp.o  -lffi 

@@ -1,1 +1,0 @@
-/usr/bin/g++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,str.so -o "/home/alice/Desktop/embr cmake/bin/linux/plugins/str.so" CMakeFiles/str.dir/str/str.cpp.o 
