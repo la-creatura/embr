@@ -1,5 +1,5 @@
-//#include <embr/embr.h>
-#include "embr_vm.cpp"
+#include <embr/embr.h>
+// #include "embr_vm.cpp"
 #include <sstream>
 
 
@@ -30,7 +30,7 @@ Result runTest(const Test& t, embr::Interpreter& interp) {
 
     Result r; r.name = t.name; r.expected = t.expectedOutput;
     try {
-        embr::vm::runSource(t.code, interp, t.name);
+        embr::runSource(t.code, interp, t.name);
         r.actual = capOut.str();
         r.passed = (r.actual == r.expected);
         if (!r.passed) r.errorMsg = "output mismatch";
@@ -66,7 +66,7 @@ int runAll(const std::vector<Test>& tests) {
     //std::cout << "\n\033[1m embr test suite \033[0m\n";
     auto interp = new embr::Interpreter();  // share context to avoid importing embrlib repeatedly to test its functions
 
-    embr::vm::runSource("import \"embrlib\"", *interp, "");
+    embr::runSource("import \"embrlib\"", *interp, "");
 
     for (const auto& t : tests) {
         Result r = runTest(t, *interp);

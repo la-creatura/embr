@@ -4,8 +4,8 @@
 //   embr file.embr ...   # run one or more script files
 
 #define EMBR_NO_MAIN
-// #include <embr/embr.h>
-#include "embr_vm.cpp"
+#include <embr/embr.h>
+// #include "embr_vm.cpp"
 
 #include <iostream>
 #include <fstream>
@@ -16,21 +16,6 @@
 
 namespace fs = std::filesystem;
 
-// ---------------------------------------------------------------------
-// embr_debug :: lex + parse a string and print the resulting AST as a
-// box-drawn tree, e.g.:
-//
-//   Program (2 statements)
-//   ├── Local x  (L1)
-//   │   └── Number 5
-//   └── ExprStmt  (L2)
-//       └── Call print (1 args)  (L2)
-//           └── Binary +
-//               ├── Var x
-//               └── Number 1
-//
-// bound into the interpreter as ast(src) / ast_file(path) for REPL use.
-// ---------------------------------------------------------------------
 namespace embr_debug {
 
 using ChildFn = std::function<void(std::ostream&, const std::string&, bool)>;
@@ -278,7 +263,7 @@ static void runFile(const std::string& path, embr::Interpreter& interp) {
     std::string src((std::istreambuf_iterator<char>(f)), {});
 
     interp.scriptDir = fs::absolute(path).parent_path().string();
-    embr::vm::runSource(src, interp, path);
+    embr::runSource(src, interp, path);
 }
 
 // nesting depth
@@ -321,7 +306,7 @@ static void repl(embr::Interpreter& interp) {
         depth = 0; // clamp
 
         try {
-            embr::vm::runSource(accumulated, interp, "<repl>");
+            embr::runSource(accumulated, interp, "<repl>");
         } catch (const embr::EmbrError& e) {
             std::cerr << e.what();
         } catch (const std::exception& e) {
@@ -330,8 +315,6 @@ static void repl(embr::Interpreter& interp) {
         accumulated.clear();
     }
 }
-
-//#include "../plugins/embrlib/embrlib.cpp"
 
 int main(int argc, char** argv) {
     embr::Interpreter interp;
@@ -348,7 +331,6 @@ int main(int argc, char** argv) {
             std::cout << "   " << tokens[i].text;
         return embr::Value(0.0);
     });
-    //registerEmbrLib(interp);
 #ifdef _WIN32
     embr::enableAnsi();
 #endif
