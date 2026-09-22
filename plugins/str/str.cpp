@@ -9,7 +9,7 @@ static Param pStr(std::string n)                      { return Param::req(std::m
 //static Param pArr(std::string n)                      { return Param::req(std::move(n), TS::Arr); }
 //static Param pMap(std::string n)                      { return Param::req(std::move(n), TS::Map); }
 static Param pNum(std::string n)                      { return Param::req(std::move(n), TS::Num); }
-//static Param pOpt(std::string n, TypeSet m = TS::Any) { return Param::opt(std::move(n), m);       }
+static Param pOpt(std::string n, TypeSet m = TS::Any) { return Param::opt(std::move(n), m);       }
 
 static void throwError(const std::string& fn, const std::string& msg) {
     raiseError("[str:" + fn + "]", msg);
@@ -130,7 +130,7 @@ EMBR_PLUGIN {
     interp->bindSig("str_strip",      {pStr("string")}, str_strip);
     interp->bindSig("str_lower",      {pStr("string")}, str_lower);
     interp->bindSig("str_upper",      {pStr("string")}, str_upper);
-    interp->bindSig("str_find",       {pStr("string"), pStr("substring"), pNum("start_pos")}, str_find);
+    interp->bindSig("str_find",       {pStr("string"), pStr("substring"), pOpt("start_pos", TS::Num)}, str_find);
     interp->bindSig("str_startswith", {pStr("string"), pStr("prefix")}, str_startswith);
     interp->bindSig("str_endswith",   {pStr("string"), pStr("suffix")}, str_endswith);
     interp->bindSig("str_isdigit",    {pStr("string")}, str_isdigit);

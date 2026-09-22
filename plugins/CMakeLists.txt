@@ -23,6 +23,8 @@ endfunction()
 add_plugin(embrlib embrlib.cpp)
 add_plugin(str str.cpp)
 add_plugin(embrffi embrffi.cpp)
+
+# mingw needs packaged libffi because pkg-config pulls in glibc headers that don't exist in windows environment
 if(MINGW)
 
     target_include_directories(embrffi PRIVATE
@@ -38,6 +40,7 @@ if(MINGW)
         ${CMAKE_SOURCE_DIR}/include/libffi/lib/libffi.a
     )
 
+# linux can use system libffi via pkg-config.
 else()
 
     find_package(PkgConfig REQUIRED)

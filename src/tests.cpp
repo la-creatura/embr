@@ -1,4 +1,5 @@
-#include <embr/embr.h>
+//#include <embr/embr.h>
+#include "embr_vm.cpp"
 #include <sstream>
 
 
@@ -29,7 +30,7 @@ Result runTest(const Test& t, embr::Interpreter& interp) {
 
     Result r; r.name = t.name; r.expected = t.expectedOutput;
     try {
-        embr::runSource(t.code, interp, t.name);
+        embr::vm::runSource(t.code, interp, t.name);
         r.actual = capOut.str();
         r.passed = (r.actual == r.expected);
         if (!r.passed) r.errorMsg = "output mismatch";
@@ -65,7 +66,7 @@ int runAll(const std::vector<Test>& tests) {
     //std::cout << "\n\033[1m embr test suite \033[0m\n";
     auto interp = new embr::Interpreter();  // share context to avoid importing embrlib repeatedly to test its functions
 
-    embr::runSource("import \"embrlib\"", *interp, "");
+    embr::vm::runSource("import \"embrlib\"", *interp, "");
 
     for (const auto& t : tests) {
         Result r = runTest(t, *interp);
@@ -91,12 +92,6 @@ int main() {
     embr::enableAnsi();
 #endif
     std::vector<Test> tests = {
-
-        { "import: embrlib",
-          "import \"embrlib\"\n",
-          "[runtime] loaded plugin: /home/alice/Desktop/embr/bin/plugins/embrlib.so\n" },  // dented. temporary
-
-
 
         { "arithmetic: basic ops",
           "print(1+2)\nprint(10-3)\nprint(3*4)\nprint(10/4)\n",
@@ -446,8 +441,6 @@ int main() {
           "print(f(3))\n",
           "6\n" },
     };
-    std::cout << "uwu";
-    int owo = embr_test::runAll(tests);
-    std::cout << ":3";
-    return owo;
+    int ret = embr_test::runAll(tests);
+    return ret;
 }

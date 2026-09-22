@@ -2,12 +2,10 @@
 // usage:
 //   embr                 # start REPL
 //   embr file.embr ...   # run one or more script files
-//
-// the stdlib is registered directly (no plugin file needed at runtime)
 
 #define EMBR_NO_MAIN
-#include <embr/embr.h>
-// #include "embr_vm.cpp"
+// #include <embr/embr.h>
+#include "embr_vm.cpp"
 
 #include <iostream>
 #include <fstream>
@@ -280,7 +278,7 @@ static void runFile(const std::string& path, embr::Interpreter& interp) {
     std::string src((std::istreambuf_iterator<char>(f)), {});
 
     interp.scriptDir = fs::absolute(path).parent_path().string();
-    embr::runSource(src, interp, path);
+    embr::vm::runSource(src, interp, path);
 }
 
 // nesting depth
@@ -323,7 +321,7 @@ static void repl(embr::Interpreter& interp) {
         depth = 0; // clamp
 
         try {
-            embr::runSource(accumulated, interp, "<repl>");
+            embr::vm::runSource(accumulated, interp, "<repl>");
         } catch (const embr::EmbrError& e) {
             std::cerr << e.what();
         } catch (const std::exception& e) {

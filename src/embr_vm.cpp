@@ -35,7 +35,7 @@
 // WARNING! dented bullshit for functions to store compiled code
 namespace embr { namespace vm { struct CompiledChunk; } }
 #define EMBR_CHUNK_TYPE embr::vm::CompiledChunk
-#include "embr.cpp"
+#include <embr/embr.h>
 
 namespace embr {
 namespace vm {
@@ -244,7 +244,7 @@ private:
 
         case Expr::Kind::Call: {
             auto* c = static_cast<CallExpr*>(e);
-            emitLoad(c->name, e->range.startLine);
+            compileExpr(c->callee.get());
             for (auto& arg : c->args) compileExpr(arg.get());
             emit(Op::CALL, (int)c->args.size(), 0.0, e->range.startLine);
             break;
