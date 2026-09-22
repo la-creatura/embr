@@ -61,11 +61,15 @@ you can store the program, inspect the AST, or call `runner.invoke()` directly
 git clone --recurse-submodules https://github.com/la-cretura/embr.git
 cd embr
 
-# linux
+# installing dev libffi package on linux
+sudo apt install libffi-dev      # debian/ubuntu
+sudo dnf install libffi-devel    # fedora
+
+# building for linux
 cmake --preset linux-release
 cmake --build --preset linux-release
 
-# windows
+# building for windows (libffi bundled in source)
 cmake --preset windows-release
 cmake --build --preset windows-release
 ```
