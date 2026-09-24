@@ -5,8 +5,6 @@ project(embr LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-#target_compile_features(embr PRIVATE cxx_std_20)
-
 add_compile_options(
     -Wall
     -Wextra
@@ -17,11 +15,26 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# embr.h is generated at build time from the modular sources under include/embr/{core,backends}/
+# edit the modular headers
+# every target below depends on the regenerated header and rebuilds it automatically.
+include(cmake/amalgamate.cmake)
+
+embr_amalgamate(embr_single_header
+    ENTRY              ${CMAKE_SOURCE_DIR}/include/embr/core/root.h
+    OUTPUT             ${CMAKE_BINARY_DIR}/generated/embr/embr.h
+    SOURCE_DIR         ${CMAKE_SOURCE_DIR}/include/embr
+    INCLUDE_DIRS       ${CMAKE_SOURCE_DIR}/include
+    PUBLIC_INCLUDE_DIR ${CMAKE_BINARY_DIR}/generated
+    BANNER             "embr - single header build (tree-walker backend)"
+)
+# PUBLIC_INCLUDE_DIR is generated/ (not generated/embr/) so that the existing #include <embr/embr.h> keeps resolving
+
 add_executable(embr src/cli.cpp)
-target_include_directories(embr PRIVATE include)
+target_link_libraries(embr PRIVATE embr_single_header)
 
 add_executable(embr_tests src/tests.cpp)
-target_include_directories(embr_tests PRIVATE include)
+target_link_libraries(embr_tests PRIVATE embr_single_header)
 
 target_compile_options(embr PRIVATE
     $<$<CONFIG:Release>:-O3>

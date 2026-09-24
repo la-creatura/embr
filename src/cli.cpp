@@ -70,7 +70,7 @@ static void printNode(std::ostream& out, const std::string& prefix, bool isLast,
 }
 
 // wraps a statement block (then/else/body) as a single labeled child node
-// so `Then (2)` / `Else (1)` / `Body (3)` show up as their own branch.
+// so Then (2) / Else (1) / Body (3) show up as their own branch.
 static ChildFn blockPrinter(const std::vector<embr::StmtPtr>& block, std::string label) {
     return [&block, label](std::ostream& out, const std::string& prefix, bool isLast) {
         std::vector<ChildFn> kids;

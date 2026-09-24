@@ -77,9 +77,7 @@ int runAll(const std::vector<Test>& tests) {
     std::cout << "\n"
               << "  " << passed << " passed, " << failed << " failed"
               << (failed ? "  \033[31mX\033[0m" : "  \033[32m√\033[0m") << "\n\n";
-    std::cout << "before delete\n";
     delete interp;
-    std::cout << "after delete\n";
     return failed == 0 ? 0 : 1;
 }
 

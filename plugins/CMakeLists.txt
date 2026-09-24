@@ -4,10 +4,11 @@ function(add_plugin name source)
 
     add_library(${name} SHARED "${name}/${source}")
 
-    target_include_directories(${name} PRIVATE "${CMAKE_SOURCE_DIR}/include")
-    #target_include_directories(${name} PRIVATE "${PLUGIN_DIR}/${name}/include")
+    # plugins consume the generated single header, same as embr/embr_tests,
+    # so they rebuild automatically whenever a modular header changes
+    target_link_libraries(${name} PRIVATE embr_single_header)
 
-    set_target_properties(${target} PROPERTIES
+    set_target_properties(${name} PROPERTIES
         OUTPUT_NAME "${name}"
         PREFIX ""
     )
@@ -16,7 +17,6 @@ function(add_plugin name source)
         PREFIX ""
         LIBRARY_OUTPUT_DIRECTORY "${PLUGIN_DIR}"
         RUNTIME_OUTPUT_DIRECTORY "${PLUGIN_DIR}"
-        #ARCHIVE_OUTPUT_DIRECTORY "${PLUGIN_DIR}"
     )
 endfunction()
 
@@ -31,11 +31,6 @@ if(MINGW)
         ${CMAKE_SOURCE_DIR}/include/libffi/include
     )
 
-    #target_link_directories(embrffi PRIVATE
-    #    ${CMAKE_SOURCE_DIR}/include/libffi/lib
-    #)
-
-    #target_link_libraries(embrffi PRIVATE ffi)
     target_link_libraries(embrffi PRIVATE
         ${CMAKE_SOURCE_DIR}/include/libffi/lib/libffi.a
     )
