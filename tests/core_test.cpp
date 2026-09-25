@@ -1,94 +1,9 @@
-#include <embr/embr.h>
-// #include "embr_vm.cpp"
-#include <sstream>
+// core language + embrlib test suite
 
-
-namespace embr_test {
-
-static const char* G = "\033[32m";
-
-struct Test {
-    std::string name;
-    std::string code;
-    std::string expectedOutput;  // exact stdout content
-    std::string stdinData = {};  // piped to input() calls
-};
-
-struct Result {
-    std::string name;
-    bool        passed   = false;
-    std::string actual;
-    std::string expected;
-    std::string errorMsg;
-};
-
-Result runTest(const Test& t, embr::Interpreter& interp) {
-    std::ostringstream capOut;
-    std::istringstream fakeIn(t.stdinData);
-    std::streambuf* origOut = std::cout.rdbuf(capOut.rdbuf());
-    std::streambuf* origIn  = std::cin.rdbuf(fakeIn.rdbuf());
-
-    Result r; r.name = t.name; r.expected = t.expectedOutput;
-    try {
-        embr::runSource(t.code, interp, t.name);
-        r.actual = capOut.str();
-        r.passed = (r.actual == r.expected);
-        if (!r.passed) r.errorMsg = "output mismatch";
-    } catch (const embr::EmbrError& e) {
-        r.actual = capOut.str(); r.passed = false;
-        r.errorMsg = std::string("EmbrError: ") + e.what();
-    } catch (const std::exception& e) {
-        r.actual = capOut.str(); r.passed = false;
-        r.errorMsg = std::string("exception: ") + e.what();
-    }
-    std::cout.rdbuf(origOut);
-    std::cin.rdbuf(origIn);
-    return r;
-}
-
-void printResult(const Result& r) {
-    if (r.passed) {
-        std::cout << G << " [+]" << embr::X << " " << r.name << "\n";
-    } else {
-        std::cout << embr::R << " [-]" << embr::X << " " << r.name << "\n";
-        if (!r.errorMsg.empty())
-            std::cout << embr::Y << "        error: " << embr::X << r.errorMsg << "\n";
-        // show first differing line for easy scanning
-        if (!r.expected.empty() || !r.actual.empty()) {
-            std::cout << "        expected: " << embr::valueRepr(embr::Value(r.expected)) << "\n";
-            std::cout << "        actual:   " << embr::valueRepr(embr::Value(r.actual))   << "\n";
-        }
-    }
-}
-
-int runAll(const std::vector<Test>& tests) {
-    int passed = 0, failed = 0;
-    //std::cout << "\n\033[1m embr test suite \033[0m\n";
-    auto interp = new embr::Interpreter();  // share context to avoid importing embrlib repeatedly to test its functions
-
-    embr::runSource("import \"embrlib\"", *interp, "");
-
-    for (const auto& t : tests) {
-        Result r = runTest(t, *interp);
-        printResult(r);
-        r.passed ? ++passed : ++failed;
-    }
-
-    std::cout << "\n"
-              << "  " << passed << " passed, " << failed << " failed"
-              << (failed ? "  \033[31mX\033[0m" : "  \033[32m√\033[0m") << "\n\n";
-    delete interp;
-    return failed == 0 ? 0 : 1;
-}
-
-} // namespace embr_test
-
+#include "harness.h"
 
 int main() {
     using embr_test::Test;
-#ifdef _WIN32
-    embr::enableAnsi();
-#endif
     std::vector<Test> tests = {
 
         { "arithmetic: basic ops",
@@ -179,11 +94,43 @@ int main() {
           "if 1\nprint(\"ok\")\nend\n",
           "ok\n" },
 
+        { "elif: chain picks matching branch",
+          "x = 3\nif x == 1\nprint(\"a\")\nelif x == 2\nprint(\"b\")\nelif x == 3\nprint(\"c\")\nelse\nprint(\"d\")\nend\n",
+          "c\n" },
+
+        { "elif: falls through to else",
+          "x = 9\nif x == 1\nprint(\"a\")\nelif x == 2\nprint(\"b\")\nelse\nprint(\"z\")\nend\n",
+          "z\n" },
+
 
 
         { "while: sum 0..4",
           "i = 0\ns = 0\nwhile i < 5\ns = s + i\ni = i + 1\nend\nprint(s)\n",
           "10\n" },
+
+        { "while: break stops the loop early",
+          "i = 0\nwhile i < 10\n  if i == 3\n    break\n  end\n  print(i)\n  i = i + 1\nend\n",
+          "0\n1\n2\n" },
+
+        { "while: continue skips the rest of the body",
+          "i = 0\nwhile i < 5\n  i = i + 1\n  if i == 3\n    continue\n  end\n  print(i)\nend\n",
+          "1\n2\n4\n5\n" },
+
+        { "for-in: array",
+          "for v in [10, 20, 30]\n  print(v)\nend\n",
+          "10\n20\n30\n" },
+
+        { "for-in: string",
+          "for c in \"ab\"\n  print(c)\nend\n",
+          "a\nb\n" },
+
+        { "for-in: map, two vars gives key then value",
+          "for k, v in {\"only\": 42}\n  print(k)\n  print(v)\nend\n",
+          "only\n42\n" },
+
+        { "for-in: break exits the loop",
+          "for v in [1,2,3,4]\n  if v == 3\n    break\n  end\n  print(v)\nend\n",
+          "1\n2\n" },
 
 
 
@@ -212,7 +159,7 @@ int main() {
 
         { "type conversions",
           "print(num(\"3.14\"))\nprint(str(42))\nprint(type(1))\nprint(type(\"a\"))\n",
-          "3.14\n42\nnumber\nstring\n" },
+          "3.14\n42\nint\nstring\n" },
 
 
 
@@ -283,7 +230,7 @@ int main() {
           "i = 0\nwhile i < 4\n  i += 1\nend\nprint(i)\n",
           "4\n" },
 
-        
+
         { "and: both true",
           "print(1 and 1)\n",
           "1\n" },
@@ -315,7 +262,6 @@ int main() {
           "hello world\n" },
 
 
-        
         { "did-you-mean: typo in fn name",
           "x = [1,2,3]\nlen(x)\nprint(\"ok\")\n",
           "ok\n" },
@@ -351,7 +297,7 @@ int main() {
 
         { "fn_sig: annotated params and return",
           "double(x: num) -> num = x * 2\nprint(fn_sig(double))\n",
-          "double(x: number) -> number\n" },
+          "double(x: number|int) -> number|int\n" },
         { "is_native",
           "print(is_native(print))\nbaz() = 0\nprint(is_native(baz))\n",
           "1\n0\n" },
@@ -438,7 +384,94 @@ int main() {
           "f = mid(2)\n"
           "print(f(3))\n",
           "6\n" },
+
+
+
+        { "int/float: literal defaults",
+          "print(type(5))\nprint(type(5.0))\nprint(5 == 5.0)\n",
+          "int\nnumber\n1\n" },
+
+        { "int: exact arithmetic beyond double precision",
+          "print(9007199254740993 + 1)\n",
+          "9007199254740994\n" },
+
+        { "int: division always widens to float",
+          "print(7 / 2)\nprint(7 % 2)\n",
+          "3.5\n1\n" },
+
+        { "variadic: fn collects trailing args into an array",
+          "fn sum(...nums)\n"
+          "  total = 0\n"
+          "  for n in nums\n"
+          "    total = total + n\n"
+          "  end\n"
+          "  return total\n"
+          "end\n"
+          "print(sum(1,2,3,4))\nprint(sum())\n",
+          "10\n0\n" },
+
+        { "variadic: lambda variadic",
+          "f = fn(...args) return len(args) end\nprint(f(1,2,3))\n",
+          "3\n" },
+
+        { "local typed: enforces declared type on later assignment",
+          "local int x = 5\nprint(x)\nx = 10\nprint(x)\n",
+          "5\n10\n" },
+
+        { "local auto: infers type from initializer and enforces it",
+          "local auto x = 5\nprint(type(x))\n",
+          "int\n" },
+
+        { "destructure: comma form with mixed types",
+          "local int a, str b, c = [1, \"2\", 3]\nprint(a)\nprint(b)\nprint(c)\n",
+          "1\n2\n3\n" },
+
+        { "destructure: bracket form with shared type",
+          "local int [a, b] = [10, 20]\nprint(a)\nprint(b)\n",
+          "10\n20\n" },
+
+        { "destructure: map unpacks to (keys, values)",
+          "local k, v = {\"only\": 42}\nprint(k[0])\nprint(v[0])\n",
+          "only\n42\n" },
+
+        { "destructure: plain multi-assign reuses existing variables",
+          "a = 0\nb = 0\na, b = [7, 8]\nprint(a)\nprint(b)\n",
+          "7\n8\n" },
+
+        { "try/catch: catches error() and binds message",
+          "try\nerror(\"boom\")\nprint(\"unreachable\")\ncatch e\nprint(\"caught: \" + e)\nend\nprint(\"after\")\n",
+          "caught: boom\nafter\n" },
+
+        { "try/catch: catches assert() failure",
+          "try\nassert(0, \"nope\")\ncatch e\nprint(e)\nend\n",
+          "nope\n" },
+
+        { "try/catch: no error means catch block is skipped",
+          "try\nprint(\"ok\")\ncatch e\nprint(\"unreachable\")\nend\n",
+          "ok\n" },
+
+        { "try/catch: catches an error raised deep in a called function",
+          "fn risky(n)\nif n < 0\nerror(\"negative\")\nend\nreturn n * 2\nend\n"
+          "fn safe(n)\ntry\nreturn risky(n)\ncatch e\nreturn -1\nend\nend\n"
+          "print(safe(5))\nprint(safe(-5))\n",
+          "10\n-1\n" },
+
+        { "try/catch: catch var is block-scoped",
+          "try\nerror(\"x\")\ncatch e\nprint(e)\nend\n"
+          "try\nprint(e)\nprint(\"leaked\")\ncatch e2\nprint(\"properly scoped\")\nend\n",
+          "x\nproperly scoped\n" },
+
+        { "try/catch: break inside try still exits the enclosing loop",
+          "i = 0\nwhile i < 3\ntry\nif i == 1\nbreak\nend\nprint(i)\ncatch e\nprint(\"unreachable\")\nend\ni = i + 1\nend\nprint(\"i=\" + str(i))\n",
+          "0\ni=1\n" },
+
+        { "try/catch: error inside a loop iteration is caught and looping continues",
+          "i = 0\nwhile i < 3\ntry\nif i == 1\nerror(\"skip\")\nend\nprint(i)\ncatch e\nprint(\"caught \" + str(i))\nend\ni = i + 1\nend\n",
+          "0\ncaught 1\n2\n" },
+
+        { "slice: supports maps by key-index range",
+          "m = {\"a\": 1}\nprint(len(slice(m, 0, 1)))\n",
+          "1\n" },
     };
-    int ret = embr_test::runAll(tests);
-    return ret;
+    return embr_test::runSuite("embr core test suite", tests, {"embrlib"});
 }

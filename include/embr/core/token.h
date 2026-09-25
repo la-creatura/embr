@@ -10,7 +10,7 @@ namespace embr {
 enum class TokenType {
     Identifier, Number, String,
     LParen, RParen,  LBracket, RBracket, LCurly, RCurly,
-    Colon,  Comma,   Dot,
+    Colon,  Comma,   Dot,     Ellipsis,
     Plus,   Minus,   Star,   Slash,
     PlusEq, MinusEq, StarEq, SlashEq,
     Percent,
@@ -19,7 +19,8 @@ enum class TokenType {
     Bang, BangEqual,
     LArrow, RArrow,
     And, Or,
-    If, Else, End, Fn, Return, While, Import, Local,
+    If, Elif, Else, End, Fn, Return, While, For, In, Break, Continue, Import, Local, Auto,
+    Try, Catch,
     Eof
 };
 

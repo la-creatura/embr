@@ -1,9 +1,8 @@
 #ifndef EMBR_BACKENDS_TREE_WALKER_H
 #define EMBR_BACKENDS_TREE_WALKER_H
 
-// the original, portable, easy-to-embed executor: walks the AST directly.
-// this is what runSource() drives by default. see backends/vm.h (when
-// built) for the bytecode alternative aimed at standalone/performance use.
+// portable, easy-to-embed backend which walks the AST
+// see the vm backend for more performance
 
 #include "../core/diagnostics.h"
 #include "../core/types.h"
@@ -24,9 +23,13 @@
 #include <cmath>
 #include <numeric>
 
+#ifdef EMBR_WITH_TREE_WALKER
+
 namespace embr {
 
-struct ReturnSignal { Value value; };
+struct ReturnSignal   { Value value; };
+struct BreakSignal    {};
+struct ContinueSignal {};
 
 class Runner {
 public:
@@ -134,6 +137,7 @@ private:
                    const SourceRange& site) {
         if (!callee.isCallable())
             error("value is not callable (got " + callee.typeName() + ")", site);
+        Interpreter::CallDepthGuard depthGuard(interp, site);
         const auto& c = callee.asCallable();
 
         if (c.isNative()) {
@@ -144,22 +148,34 @@ private:
                 return c.native(args);
             } catch (EmbrError& e) {
                 if (!e.hasLocation && site.valid()) {
-                    raiseError(c.name(), e.what(), site, interp.sourceMap());
+                    // re-raise with call site location attached with raw message
+                    raiseError(c.name(), e.message, site, interp.sourceMap());
                 }
                 throw;
             }
         }
         const ScriptFn& fn = c.script;
-        if (args.size() < fn.params.size())
-            error("'" + fn.name + "' expects " + std::to_string(fn.params.size()) +
-                  " args, got " + std::to_string(args.size()), site);
-        // typecheck
-        for (size_t k = 0; k < fn.params.size() && k < args.size(); ++k) {
+        bool   hasVariadic = !fn.params.empty() && fn.params.back().variadic;
+        size_t fixedCount  = hasVariadic ? fn.params.size() - 1 : fn.params.size();
+
+        if (args.size() < fixedCount)
+            error("'" + fn.name + "' expects " + (hasVariadic ? "at least " : "") +
+                  std::to_string(fixedCount) + " args, got " + std::to_string(args.size()), site);
+        // typecheck the fixed params
+        for (size_t k = 0; k < fixedCount; ++k) {
             const auto& p = fn.params[k];
             if (p.type.isAny()) continue;
             if (!p.type.contains(args[k].tag()))
                 error("argument '" + p.name + "' to '" + fn.name + "': expected " +
                       p.type.name() + " but got " + args[k].typeName(), site);
+        }
+        // typecheck each element collected into the variadic tail, if it carries a type
+        if (hasVariadic && !fn.params.back().type.isAny()) {
+            const auto& vp = fn.params.back();
+            for (size_t k = fixedCount; k < args.size(); ++k)
+                if (!vp.type.contains(args[k].tag()))
+                    error("argument " + std::to_string(k) + " to '" + fn.name + "' ('..." + vp.name +
+                          "'): expected " + vp.type.name() + " but got " + args[k].typeName(), site);
         }
 
         // push capture frame first (outermost), then a fresh param scope on top
@@ -177,8 +193,12 @@ private:
             ~MultiPop() { while (n-- > 0) i.pop(); }
         } guard{interp, fn.captured ? 2 : 1};
 
-        for (size_t k = 0; k < fn.params.size(); ++k)
+        for (size_t k = 0; k < fixedCount; ++k)
             interp.define(fn.params[k].name, args[k]);
+        if (hasVariadic) {
+            Value::array_type rest(args.begin() + fixedCount, args.end());
+            interp.define(fn.params.back().name, Value(std::move(rest)));
+        }
         Value result(0.0);
 
         try { for (auto& s : *fn.body) exec(s.get()); }
@@ -247,6 +267,7 @@ private:
     Value eval(Expr* e) {
         switch (e->kind) {
             case Expr::Kind::Number: return Value(static_cast<NumberExpr*>(e)->v);
+            case Expr::Kind::Int:    return Value(static_cast<IntExpr*>(e)->v);
             case Expr::Kind::String: return Value(static_cast<StringExpr*>(e)->v);
             case Expr::Kind::Var: {
                 auto* v = static_cast<VarExpr*>(e);
@@ -256,7 +277,7 @@ private:
             case Expr::Kind::Unary: {
                 auto* u = static_cast<UnaryExpr*>(e);
                 Value r = eval(u->right.get());
-                if (u->op == "-") return Value(-r.asNumber());
+                if (u->op == "-") return r.isInt() ? Value(-r.asInt()) : Value(-r.asNumber());
                 if (u->op == "!") return Value(!r.truthy());
                 error("unknown unary op: " + u->op, u->range);
             }
@@ -312,7 +333,18 @@ private:
         if (l.isString()||r.isString()) {
             std::string a=l.formatAsString(), c=r.formatAsString();
             if (op=="+")  return Value(a+c);
-        } else if (l.isNumber()&&r.isNumber()) {
+        } else if (l.isInt() && r.isInt()) {
+            int64_t a=l.asInt(), c=r.asInt();
+            if (op=="+")  return Value(a+c);
+            if (op=="-")  return Value(a-c);
+            if (op=="*")  return Value(a*c);
+            if (op=="/")  { if(c==0)   error("division by zero",b->range); return Value((double)a/(double)c); }
+            if (op=="%")  { if(c==0)   error("modulo by zero",b->range);   return Value(a%c); }
+            if (op==">")  return Value(a>c);
+            if (op=="<")  return Value(a<c);
+            if (op==">=") return Value(a>=c);
+            if (op=="<=") return Value(a<=c);
+        } else if (l.isNumeric() && r.isNumeric()) {
             double a=l.asNumber(), c=r.asNumber();
             if (op=="+")  return Value(a+c);
             if (op=="-")  return Value(a-c);
@@ -364,15 +396,58 @@ private:
         return doInvoke(callee, args, call->range);
     }
 
+    // unpacks src into count Values for destructuring local/multi-assign
+    std::vector<Value> unpackForDestructure(const Value& src, size_t count, const SourceRange& r) {
+        if (src.isArray()) {
+            const auto& arr = src.asArray();
+            if (arr.size() < count)
+                error("cannot unpack " + std::to_string(count) + " variable" + (count == 1 ? "" : "s") +
+                      " from an array of " + std::to_string(arr.size()) + " element" +
+                      (arr.size() == 1 ? "" : "s"), r);
+            return std::vector<Value>(arr.begin(), arr.begin() + count);
+        }
+        if (src.isMap()) {
+            if (count != 2)
+                error("unpacking a map requires exactly 2 targets (keys, values), got " +
+                      std::to_string(count), r);
+            Value::array_type ks, vs;
+            for (const auto& [k, v] : src.asMap()) { ks.push_back(Value(k)); vs.push_back(v); }
+            return { Value(std::move(ks)), Value(std::move(vs)) };
+        }
+        error("cannot unpack " + src.typeName() + " into " + std::to_string(count) +
+              " variable" + (count == 1 ? "" : "s"), r);
+    }
+
+    // defines one local destructuring target
+    void defineTyped(const DestructureTarget& t, const Value& v, const SourceRange& r) {
+        TypeSet ts = t.isAuto ? TypeSet(v.tag()) : t.type;
+        if (!ts.isAny() && !ts.contains(v.tag()))
+            error("cannot assign " + v.typeName() + " to '" + t.name + "' declared as " + ts.name(), r);
+        interp.define(t.name, v, ts);
+        if (interp.atModuleTopScope()) interp.markModuleLocal(t.name);
+    }
+
     void exec(Stmt* s) {
         switch (s->kind) {
             case Stmt::Kind::Local: {
                 auto* l = static_cast<LocalStmt*>(s);
-                interp.define(l->name, eval(l->value.get()));
-                // track as module-local so it is excluded from exports
-                if (interp.atModuleTopScope())
-                    interp.markModuleLocal(l->name);
+                Value rhs = eval(l->value.get());
 
+                if (l->targets.size() == 1 && !l->bracketed) {
+                    defineTyped(l->targets[0], rhs, l->range);
+                } else {
+                    auto vals = unpackForDestructure(rhs, l->targets.size(), l->range);
+                    for (size_t i = 0; i < l->targets.size(); ++i)
+                        defineTyped(l->targets[i], vals[i], l->range);
+                }
+                break;
+            }
+            case Stmt::Kind::MultiAssign: {
+                auto* m = static_cast<MultiAssignStmt*>(s);
+                Value rhs = eval(m->value.get());
+                auto vals = unpackForDestructure(rhs, m->names.size(), m->range);
+                for (size_t i = 0; i < m->names.size(); ++i)
+                    interp.set(m->names[i], std::move(vals[i]));
                 break;
             }
             case Stmt::Kind::Assign: execAssign(static_cast<AssignStmt*>(s)); break;
@@ -405,7 +480,25 @@ private:
                 auto* w = static_cast<WhileStmt*>(s);
                 while (eval(w->cond.get()).truthy()) {
                     Interpreter::ScopeGuard guard(interp);
-                    for (auto& st : w->body) exec(st.get());
+                    try { for (auto& st : w->body) exec(st.get()); }
+                    catch (BreakSignal&)    { break; }
+                    catch (ContinueSignal&) { continue; }
+                }
+                break;
+            }
+            case Stmt::Kind::For: execFor(static_cast<ForStmt*>(s)); break;
+            case Stmt::Kind::Break:    throw BreakSignal{};
+            case Stmt::Kind::Continue: throw ContinueSignal{};
+            case Stmt::Kind::Try: {
+                auto* t = static_cast<TryStmt*>(s);
+                try {
+                    Interpreter::ScopeGuard guard(interp);
+                    for (auto& st : t->tryBlock) exec(st.get());
+                } catch (const EmbrError& e) {
+                    // BreakSignal/ContinueSignal/ReturnSignal aren't EmbrError
+                    Interpreter::ScopeGuard guard(interp);
+                    interp.define(t->catchVar, Value(e.message));
+                    for (auto& st : t->catchBlock) exec(st.get());
                 }
                 break;
             }
@@ -414,6 +507,48 @@ private:
                 execImport(im->path, im->range);
                 break;
             }
+        }
+    }
+
+    void execFor(ForStmt* f) {
+        Value coll = eval(f->iterable.get());
+
+        auto runBody = [&]() -> bool { // false = break
+            try { for (auto& st : f->body) exec(st.get()); }
+            catch (BreakSignal&)    { return false; }
+            catch (ContinueSignal&) { /* nothing */ }
+            return true;
+        };
+
+        if (coll.isArray()) {
+            if (!f->keyName.empty())
+                error("for-in over an array takes a single loop variable, not 'for k, v in ...'", f->range);
+            for (const auto& el : coll.asArray()) {
+                Interpreter::ScopeGuard guard(interp);
+                interp.define(f->varName, el);
+                if (!runBody()) break;
+            }
+        } else if (coll.isMap()) {
+            for (const auto& [k, v] : coll.asMap()) {
+                Interpreter::ScopeGuard guard(interp);
+                if (!f->keyName.empty()) {
+                    interp.define(f->keyName, Value(k));
+                    interp.define(f->varName, v);
+                } else {
+                    interp.define(f->varName, Value(k));
+                }
+                if (!runBody()) break;
+            }
+        } else if (coll.isString()) {
+            if (!f->keyName.empty())
+                error("for-in over a string takes a single loop variable, not 'for k, v in ...'", f->range);
+            for (char c : coll.asString()) {
+                Interpreter::ScopeGuard guard(interp);
+                interp.define(f->varName, Value(std::string(1, c)));
+                if (!runBody()) break;
+            }
+        } else {
+            error("cannot iterate over " + coll.typeName() + " with for-in", f->range);
         }
     }
 
@@ -576,7 +711,7 @@ private:
         interp.scriptDir = savedDir;
         interp.setSource(savedMap, savedFile);
 
-        // export: copy non-local bindings into the importer's current scope
+        // copy non-local bindings into the importer's current scope
         for (auto& [name, val] : moduleScope) {
             if (!moduleLocals.count(name))
                 interp.define(name, std::move(val));
@@ -666,4 +801,5 @@ inline void runSource(const std::string& src, Interpreter& interp,
 
 } // namespace embr
 
+#endif // EMBR_WITH_TREE_WALKER
 #endif // EMBR_BACKENDS_TREE_WALKER_H

@@ -94,8 +94,13 @@ struct SourceRange {
 struct EmbrError : std::runtime_error {
     bool        hasLocation;
     SourceRange range;
-    explicit EmbrError(const std::string& msg, bool loc = false, SourceRange r = {})
-        : std::runtime_error(msg), hasLocation(loc), range(r) {}
+    // unformatted message passed to raiseError() try ... catch e ... end binds e to
+    // since the fully formatted what() is meant for terminal display, not for a script to inspect/compare/re-report
+    std::string message;
+    explicit EmbrError(const std::string& formatted, bool loc = false, SourceRange r = {},
+                        std::string raw = {})
+        : std::runtime_error(formatted), hasLocation(loc), range(r),
+          message(raw.empty() ? formatted : std::move(raw)) {}
 };
 
 [[noreturn]] inline void raiseError(
@@ -118,7 +123,7 @@ struct EmbrError : std::runtime_error {
                 << "\n";
         }
     }
-    throw EmbrError(out.str(), range.valid(), range);
+    throw EmbrError(out.str(), range.valid(), range, msg);
 }
 
 [[noreturn]] inline void raiseError(const std::string& context, const std::string& msg,
@@ -127,7 +132,7 @@ struct EmbrError : std::runtime_error {
     out << "[" << context << "] " << msg;
     if (range.valid()) out << " at line " << range.startLine << ", col " << range.startCol;
     out << "\n";
-    throw EmbrError(out.str(), range.valid(), range);
+    throw EmbrError(out.str(), range.valid(), range, msg);
 }
 
 } // namespace embr

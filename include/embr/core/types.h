@@ -10,12 +10,13 @@
 namespace embr {
 
 enum class TypeTag : uint8_t {
-    Number   = 1 << 0,
-    String   = 1 << 1,
-    Array    = 1 << 2,
-    Map      = 1 << 3,
-    Callable = 1 << 4,
-    Pointer  = 1 << 5,
+    Number   = 1 << 0,  // f64 float
+    Int      = 1 << 1,  // i64 exact integer
+    String   = 1 << 2,
+    Array    = 1 << 3,
+    Map      = 1 << 4,
+    Callable = 1 << 5,
+    Pointer  = 1 << 6,
 };
 
 struct TypeSet {
@@ -42,6 +43,7 @@ struct TypeSet {
         struct Row { TypeTag tag; const char* nm; };
         static constexpr Row kTypes[] = {
             {TypeTag::Number,   "number"},
+            {TypeTag::Int,      "int"},
             {TypeTag::String,   "string"},
             {TypeTag::Array,    "array"},
             {TypeTag::Map,      "map"},
@@ -54,8 +56,12 @@ struct TypeSet {
         return s.empty() ? "?" : s;
     }
 
+    // num is a supertype (Number|Int)
+    // float/double and int specify the exact type
     static TypeSet fromName(const std::string& n) {
-        if (n == "num" || n == "number")                  return TypeSet(TypeTag::Number);
+        if (n == "num" || n == "number")                  return TypeSet(TypeTag::Number) | TypeSet(TypeTag::Int);
+        if (n == "float" || n == "double")                return TypeSet(TypeTag::Number);
+        if (n == "int" || n == "integer")                 return TypeSet(TypeTag::Int);
         if (n == "str" || n == "string")                  return TypeSet(TypeTag::String);
         if (n == "arr" || n == "array")                   return TypeSet(TypeTag::Array);
         if (n == "map")                                   return TypeSet(TypeTag::Map);
@@ -67,13 +73,15 @@ struct TypeSet {
 };
 
 namespace TS {
-    inline constexpr TypeSet Num  = TypeSet(TypeTag::Number);
-    inline constexpr TypeSet Str  = TypeSet(TypeTag::String);
-    inline constexpr TypeSet Arr  = TypeSet(TypeTag::Array);
-    inline constexpr TypeSet Map  = TypeSet(TypeTag::Map);
-    inline constexpr TypeSet Fn   = TypeSet(TypeTag::Callable);
-    inline constexpr TypeSet Ptr  = TypeSet(TypeTag::Pointer);
-    inline constexpr TypeSet Any  = TypeSet(0xFF);
+    inline constexpr TypeSet Float = TypeSet(TypeTag::Number);
+    inline constexpr TypeSet Int   = TypeSet(TypeTag::Int);
+    inline constexpr TypeSet Num   = TypeSet(TypeTag::Number) | TypeSet(TypeTag::Int); // any numeric (float or int)
+    inline constexpr TypeSet Str   = TypeSet(TypeTag::String);
+    inline constexpr TypeSet Arr   = TypeSet(TypeTag::Array);
+    inline constexpr TypeSet Map   = TypeSet(TypeTag::Map);
+    inline constexpr TypeSet Fn    = TypeSet(TypeTag::Callable);
+    inline constexpr TypeSet Ptr   = TypeSet(TypeTag::Pointer);
+    inline constexpr TypeSet Any   = TypeSet(0xFF);
 }
 
 struct Param {

@@ -118,10 +118,60 @@ Value str_ord(const std::vector<Value>& args) {
 }
 
 Value str_chr(const std::vector<Value>& args) {
-    if (!args[0].isNumber()) throwError("chr", "argument must be a number");
+    if (!args[0].isNumeric()) throwError("chr", "argument must be a number");
     int code = (int)args[0].asNumber();
     if (code < 0 || code > 255) throwError("chr", "code point out of range (0-255)");
     return Value(std::string(1, (char)code));
+}
+
+Value str_repeat(const std::vector<Value>& args) {
+    const std::string& s = args[0].asString();
+    int n = (int)args[1].asNumber();
+    if (n < 0) throwError("str_repeat", "count must not be negative");
+    std::string out;
+    out.reserve(s.size() * (size_t)n);
+    for (int i = 0; i < n; ++i) out += s;
+    return Value(std::move(out));
+}
+
+Value str_reverse(const std::vector<Value>& args) {
+    std::string s = args[0].asString();
+    std::reverse(s.begin(), s.end());
+    return Value(std::move(s));
+}
+
+Value str_pad_left(const std::vector<Value>& args) {
+    std::string s = args[0].asString();
+    int width = (int)args[1].asNumber();
+    std::string ch = args.size() >= 3 ? args[2].asString() : " ";
+    if (ch.size() != 1) throwError("str_pad_left", "pad char must be a single character");
+    if ((int)s.size() >= width) return Value(std::move(s));
+    return Value(std::string((size_t)width - s.size(), ch[0]) + s);
+}
+
+Value str_pad_right(const std::vector<Value>& args) {
+    std::string s = args[0].asString();
+    int width = (int)args[1].asNumber();
+    std::string ch = args.size() >= 3 ? args[2].asString() : " ";
+    if (ch.size() != 1) throwError("str_pad_right", "pad char must be a single character");
+    if ((int)s.size() >= width) return Value(std::move(s));
+    return Value(s + std::string((size_t)width - s.size(), ch[0]));
+}
+
+Value str_ltrim(const std::vector<Value>& args) {
+    std::string s = args[0].asString();
+    std::string chars = " \t\n\r\f\v";
+    size_t start = s.find_first_not_of(chars);
+    if (start == std::string::npos) return Value(std::string(""));
+    return Value(s.substr(start));
+}
+
+Value str_rtrim(const std::vector<Value>& args) {
+    std::string s = args[0].asString();
+    std::string chars = " \t\n\r\f\v";
+    size_t end = s.find_last_not_of(chars);
+    if (end == std::string::npos) return Value(std::string(""));
+    return Value(s.substr(0, end + 1));
 }
 
 EMBR_PLUGIN {
@@ -139,4 +189,10 @@ EMBR_PLUGIN {
     interp->bindSig("str_count",      {pStr("string"), pStr("substring")}, str_count);
     interp->bindSig("str_ord",        {pStr("char")},   str_ord);
     interp->bindSig("str_chr",        {pNum("ord")},    str_chr);
+    interp->bindSig("str_repeat",     {pStr("string"), pNum("count")}, str_repeat);
+    interp->bindSig("str_reverse",    {pStr("string")}, str_reverse);
+    interp->bindSig("str_pad_left",   {pStr("string"), pNum("width"), pOpt("pad_char", TS::Str)}, str_pad_left);
+    interp->bindSig("str_pad_right",  {pStr("string"), pNum("width"), pOpt("pad_char", TS::Str)}, str_pad_right);
+    interp->bindSig("str_ltrim",      {pStr("string")}, str_ltrim);
+    interp->bindSig("str_rtrim",      {pStr("string")}, str_rtrim);
 }

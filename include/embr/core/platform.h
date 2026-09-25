@@ -8,6 +8,7 @@
 #include <string>
 
 #ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
@@ -16,8 +17,6 @@
 namespace embr {
 
 #if defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
-
    inline void enableAnsi()
    {
        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);

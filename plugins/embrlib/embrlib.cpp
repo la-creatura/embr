@@ -39,6 +39,17 @@ void registerEmbrLib(Interpreter& interp) {
         return Value(0.0);
     });
 
+    // error(msg: str) -> never returns normally
+    // raises a script error carrying msg
+    // catchable from script with try ... catch e ... end
+    // the return type is never actually used
+    // it exists so error() type-checks as an ordinary callable expression
+    interp.bindSig("error", {pStr("msg")},
+    [](const std::vector<Value>& args) -> Value {
+        raiseError("error", args[0].asString());
+        return Value(0.0);
+    });
+
 
 
     // type(val) -> str
@@ -50,7 +61,7 @@ void registerEmbrLib(Interpreter& interp) {
     // num(val: str|num) -> num
     interp.bindSig("num", {Param::req("val", TS::Num|TS::Str)},
     [](const std::vector<Value>& args) -> Value {
-        if (args[0].isNumber()) return args[0];
+        if (args[0].isNumeric()) return args[0];
         const auto& s = args[0].asString();
         double d;
         auto [ptr, ec] = parse_double(s.data(), s.data() + s.size(), d);
@@ -121,7 +132,7 @@ void registerEmbrLib(Interpreter& interp) {
     });
 
     // slice(container: arr|str, start: num, end?: num) -> arr
-    interp.bindSig("slice", {Param::req("container", TS::Arr|TS::Str), pNum("start"), pOpt("end", TS::Num)},
+    interp.bindSig("slice", {Param::req("container", TS::Arr|TS::Str|TS::Map), pNum("start"), pOpt("end", TS::Num)},
     [](const std::vector<Value>& args) -> Value {
         if (args[0].isArray()) {
             const auto& arr = args[0].asArray();
@@ -130,6 +141,20 @@ void registerEmbrLib(Interpreter& interp) {
             start = std::max(0,     std::min(start, (int)arr.size()));
             end   = std::max(start, std::min(end,   (int)arr.size()));
             return Value(Value::array_type(arr.begin() + start, arr.begin() + end));
+        } else if (args[0].isMap()) {
+            // maps have no defined order, so this slices whatever order the map currently iterates in
+            // stable for a given map instance, not guaranteed across runs/rebuilds.
+            const auto& m = args[0].asMap();
+            std::vector<std::string> keys;
+            keys.reserve(m.size());
+            for (const auto& [k, v] : m) keys.push_back(k);
+            int start = (int)args[1].asNumber();
+            int end   = args.size() >= 3 ? (int)args[2].asNumber() : (int)keys.size();
+            start = std::max(0,     std::min(start, (int)keys.size()));
+            end   = std::max(start, std::min(end,   (int)keys.size()));
+            Value::map_type out;
+            for (int i = start; i < end; ++i) out[keys[i]] = m.at(keys[i]);
+            return Value(std::move(out));
         } else {
             const auto& s = args[0].asString();
             int start = (int)args[1].asNumber();
@@ -167,10 +192,9 @@ void registerEmbrLib(Interpreter& interp) {
     // call(fn: fn, args?: arr) -> any
     interp.bindSig("call", {pFn("fn"), pOpt("args", TS::Arr)},
     [&interp](const std::vector<Value>& args) -> Value {
-        Runner r(interp);
         std::vector<Value> fargs;
         if (args.size() >= 2) fargs = args[1].asArray();
-        return r.invoke(args[0], fargs);
+        return invoke(interp, args[0], fargs);
     });
 
     // fn_name(fn: fn) -> str display name includes file:line for script fns
@@ -230,9 +254,8 @@ void registerEmbrLib(Interpreter& interp) {
     // inline if calls then_fn() or else_fn() based on truthiness of cond
     interp.bindSig("if_do", {pAny("cond"), pFn("then_fn"), pOpt("else_fn", TypeSet(TS::Fn))},
     [&interp](const std::vector<Value>& args) -> Value {
-        Runner r(interp);
-        if (args[0].truthy()) return r.invoke(args[1], {});
-        if (args.size() >= 3) return r.invoke(args[2], {});
+        if (args[0].truthy()) return invoke(interp, args[1], {});
+        if (args.size() >= 3) return invoke(interp, args[2], {});
         return Value(0.0);
     });
 
@@ -240,16 +263,14 @@ void registerEmbrLib(Interpreter& interp) {
     // calls cond_fn() before each iteration and body_fn() while truthy
     interp.bindSig("while_do", {pFn("cond_fn"), pFn("body_fn")},
     [&interp](const std::vector<Value>& args) -> Value {
-        Runner r(interp);
-        while (r.invoke(args[0], {}).truthy()) r.invoke(args[1], {});
+        while (invoke(interp, args[0], {}).truthy()) invoke(interp, args[1], {});
         return Value(0.0);
     });
 
     // do(fn: fn) -> any
     interp.bindSig("do", {pFn("fn")},
     [&interp](const std::vector<Value>& args) -> Value {
-        Runner r(interp);
-        return r.invoke(args[0], {});
+        return invoke(interp, args[0], {});
     });
 
 
@@ -257,21 +278,20 @@ void registerEmbrLib(Interpreter& interp) {
     // for_each_do(container: arr|map|str, fn: fn) -> arr|map
     interp.bindSig("for_each_do", {Param::req("container", TS::Arr|TS::Map|TS::Str), pFn("fn")},
     [&interp](const std::vector<Value>& args) -> Value {
-        Runner r(interp);
         if (TS::Arr.contains(args[0].tag())) {
             Value::array_type out;
             for (const auto& el : args[0].asArray())
-                out.push_back(r.invoke(args[1], {el}));
+                out.push_back(invoke(interp, args[1], {el}));
             return Value(std::move(out));
         } else if (TS::Map.contains(args[0].tag())) {
             Value::map_type out;
             for (const auto& [k, v] : args[0].asMap())
-                out[k] = r.invoke(args[1], {k, v});
+                out[k] = invoke(interp, args[1], {k, v});
             return Value(std::move(out));
         } else {
             Value::array_type out;
             for (const auto& el : args[0].asString())
-                out.push_back(r.invoke(args[1], {Value(std::string(1, el))}));
+                out.push_back(invoke(interp, args[1], {Value(std::string(1, el))}));
             return Value(std::move(out));
         }
     });
@@ -280,9 +300,8 @@ void registerEmbrLib(Interpreter& interp) {
     interp.bindSig("filter", {pArr("arr"), pFn("pred")},
     [&interp](const std::vector<Value>& args) -> Value {
         Value::array_type out;
-        Runner r(interp);
         for (const auto& el : args[0].asArray())
-            if (r.invoke(args[1], {el}).truthy()) out.push_back(el);
+            if (invoke(interp, args[1], {el}).truthy()) out.push_back(el);
         return Value(std::move(out));
     });
 
@@ -290,9 +309,8 @@ void registerEmbrLib(Interpreter& interp) {
     interp.bindSig("reduce", {pArr("arr"), pFn("fn"), pAny("init")},
     [&interp](const std::vector<Value>& args) -> Value {
         Value acc = args[2];
-        Runner r(interp);
         for (const auto& el : args[0].asArray())
-            acc = r.invoke(args[1], {acc, el});
+            acc = invoke(interp, args[1], {acc, el});
         return acc;
     });
 
@@ -306,7 +324,7 @@ void registerEmbrLib(Interpreter& interp) {
         bool desc = args.size() >= 2 && args[1].truthy();
 
         for (size_t i = 0; i < arr.size(); ++i) {
-            if (!arr[i].isNumber())
+            if (!arr[i].isNumeric())
                 raiseError("sort_",
                     "element at index " + std::to_string(i) +
                     " is not a number (got " + arr[i].typeName() + "). "
@@ -333,18 +351,17 @@ void registerEmbrLib(Interpreter& interp) {
         const auto& arr = args[0].asArray();
         bool desc = args.size() >= 3 && args[2].truthy();
 
-        // pre-compute weights — one interpreter call per element, not per comparison
-        Runner r(interp);
+        // pre-compute weights. one interpreter call per element, not per comparison
         std::vector<std::pair<double, Value>> weighted;
         weighted.reserve(arr.size());
 
         for (size_t i = 0; i < arr.size(); ++i) {
-            Value w = r.invoke(args[1], {arr[i]});
-            if (!w.isNumber())
+            Value w = invoke(interp, args[1], {arr[i]});
+            if (!w.isNumeric())
                 raiseError("sort_do",
                     "weight function returned " + w.typeName() +
                     " for element at index " + std::to_string(i) +
-                    " — weight must return a number");
+                    " weight must return a number");
             weighted.emplace_back(w.asNumber(), arr[i]);
         }
 
@@ -404,16 +421,136 @@ void registerEmbrLib(Interpreter& interp) {
     });
 
 
+    // write_file(path: str, contents: str) -> 0
+    //
+    // writes contents to path, overwriting any existing file
+    // path resolution matches load_file.
+    //
+    //   write_file("out.txt", "hello\n")
+    interp.bindSig("write_file", {pStr("path"), pStr("contents")},
+    [&interp](const std::vector<Value>& args) -> Value {
+        namespace fs = std::filesystem;
+
+        fs::path p(args[0].asString());
+        fs::path resolved = p.is_absolute()
+            ? p
+            : (!interp.scriptDir.empty() ? fs::path(interp.scriptDir) / p : fs::current_path() / p);
+
+        std::ofstream f(resolved, std::ios::out | std::ios::trunc);
+        if (!f)
+            raiseError("write_file", "cannot open file for writing: " + resolved.string());
+
+        f << args[1].asString();
+        return Value(0.0);
+    });
+
+    // append_file(path: str, contents: str) -> 0
+    //
+    // appends contents to path, creating it if it doesn't exist.
+    // path resolution matches write_file.
+    //
+    //   append_file("log.txt", "line\n")
+    interp.bindSig("append_file", {pStr("path"), pStr("contents")},
+    [&interp](const std::vector<Value>& args) -> Value {
+        namespace fs = std::filesystem;
+
+        fs::path p(args[0].asString());
+        fs::path resolved = p.is_absolute()
+            ? p
+            : (!interp.scriptDir.empty() ? fs::path(interp.scriptDir) / p : fs::current_path() / p);
+
+        std::ofstream f(resolved, std::ios::out | std::ios::app);
+        if (!f)
+            raiseError("append_file", "cannot open file for appending: " + resolved.string());
+
+        f << args[1].asString();
+        return Value(0.0);
+    });
+
+    // range(start: num, end: num, step?: num) -> arr
+    interp.bindSig("range", {pNum("start"), pNum("end"), pOpt("step", TS::Num)},
+    [](const std::vector<Value>& args) -> Value {
+        // if every argument was given as an int literal, produce int elements instead of silently downgrading to float
+        bool asInt = args[0].isInt() && args[1].isInt() && (args.size() < 3 || args[2].isInt());
+
+        double start = args[0].asNumber();
+        double end   = args[1].asNumber();
+        double step;
+        if (args.size() >= 3) {
+            step = args[2].asNumber();
+            if (step == 0.0) raiseError("range", "step must not be 0");
+        } else {
+            step = (end < start) ? -1.0 : 1.0;
+        }
+        if ((step > 0 && start >= end) || (step < 0 && start <= end))
+            return Value(Value::array_type{});
+        if ((step > 0) != (end > start))
+            raiseError("range", "step direction never reaches end");
+
+        Value::array_type out;
+        auto emit = [&](double v) { out.push_back(asInt ? Value((int64_t)v) : Value(v)); };
+        if (step > 0) for (double v = start; v < end; v += step) emit(v);
+        else          for (double v = start; v > end; v += step) emit(v);
+        return Value(std::move(out));
+    });
+
+    // map_merge(a: map, b: map) -> map
+    //
+    // shallow-merges two maps; keys in b win on conflict.
+    //
+    //   map_merge({"a":1}, {"a":2,"b":3})   # {"a":2,"b":3}
+    interp.bindSig("map_merge", {pMap("a"), pMap("b")},
+    [](const std::vector<Value>& args) -> Value {
+        Value::map_type out = args[0].asMap();
+        for (const auto& [k, v] : args[1].asMap()) out[k] = v;
+        return Value(std::move(out));
+    });
+
+    // map_pick(m: map, keys: arr) -> map
+    //
+    // projects m down to the given keys (keys not present in m are skipped).
+    //
+    //   map_pick({"a":1,"b":2,"c":3}, ["a","c"])   # {"a":1,"c":3}
+    interp.bindSig("map_pick", {pMap("m"), pArr("keys")},
+    [](const std::vector<Value>& args) -> Value {
+        const auto& m = args[0].asMap();
+        Value::map_type out;
+        for (const auto& k : args[1].asArray()) {
+            if (!k.isString()) raiseError("map_pick", "keys must be strings");
+            auto it = m.find(k.asString());
+            if (it != m.end()) out[it->first] = it->second;
+        }
+        return Value(std::move(out));
+    });
+
+    // map_omit(m: map, keys: arr) -> map
+    //
+    // like map_pick but excludes the given keys instead of selecting them.
+    //
+    //   map_omit({"a":1,"b":2,"c":3}, ["b"])   # {"a":1,"c":3}
+    interp.bindSig("map_omit", {pMap("m"), pArr("keys")},
+    [](const std::vector<Value>& args) -> Value {
+        Value::map_type out = args[0].asMap();
+        for (const auto& k : args[1].asArray()) {
+            if (!k.isString()) raiseError("map_omit", "keys must be strings");
+            out.erase(k.asString());
+        }
+        return Value(std::move(out));
+    });
+
     // load_module(path: str, reload?: num) -> 0
     //
-    // loads and executes an embr script module, exporting its non-local
-    // bindings into the current scope.  subsequent calls with the same
-    // resolved path are no-ops unless reload is truthy.
+    // loads and executes an embr script module, exporting its non-local bindings into the current scope
+    // subsequent calls with the same resolved path are no-ops unless reload is truthy
     //
     //   load_module("utils")        # loads utils.embr
     //   load_module("lib/math")     # loads lib/math.embr relative to caller
     //   load_module("/abs/path")    # absolute
     //   load_module("utils", 1)     # force reload
+    //
+    // only available when the tree-walker backend is compiled in
+    // it needs Runner::importEmbrModule, which the VM backend doesn't have an equivalent for yet
+#ifdef EMBR_WITH_TREE_WALKER
     interp.bindSig("load_module",
         {pStr("path"), pOpt("reload")},
     [&interp](const std::vector<Value>& args) -> Value {
@@ -460,6 +597,7 @@ void registerEmbrLib(Interpreter& interp) {
         r.importEmbrModule(rawPath, {});
         return Value(0.0);
     });
+#endif // EMBR_WITH_TREE_WALKER
 
 } // registerEmbrlib
 

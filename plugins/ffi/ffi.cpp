@@ -1,8 +1,8 @@
-// embrffi.cpp
+// ffi.cpp
 // foreign function interface plugin for embr
 //
 // usage
-//   import "embrffi"
+//   import "ffi"
 //
 
 #include <embr/embr.h>
@@ -192,7 +192,7 @@ static Value unmarshalReturn(const TypeInfo& info, const void* buf) {
 
     if (isPtr) {
         void* p; memcpy(&p, buf, sizeof(void*));
-        return Value(p);
+        return Value::makePointer(p);
     }
 
     if (isFloat) {
@@ -200,19 +200,24 @@ static Value unmarshalReturn(const TypeInfo& info, const void* buf) {
         else         { double f; memcpy(&f, buf, 8); return Value(f); }
     }
 
+    // returned as an exact int64 (not double) so large 64-bit C values round
+    // trip precisely instead of losing precision above 2^53. a uint64 whose
+    // value exceeds INT64_MAX still can't be represented exactly -- embr has
+    // one signed 64-bit integer type, not a separate unsigned one -- but this
+    // is still a strict improvement over the previous silent double truncation.
     if (isSigned) {
         switch (sz) {
-            case 1: { ffi_sarg v; memcpy(&v, buf, sizeof(v)); return Value((double)(int8_t)v);  }
-            case 2: { ffi_sarg v; memcpy(&v, buf, sizeof(v)); return Value((double)(int16_t)v); }
-            case 4: { int32_t  v; memcpy(&v, buf, 4);         return Value((double)v); }
-            case 8: { int64_t  v; memcpy(&v, buf, 8);         return Value((double)v); }
+            case 1: { ffi_sarg v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(int8_t)v);  }
+            case 2: { ffi_sarg v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(int16_t)v); }
+            case 4: { int32_t  v; memcpy(&v, buf, 4);         return Value((int64_t)v); }
+            case 8: { int64_t  v; memcpy(&v, buf, 8);         return Value(v); }
         }
     } else {
         switch (sz) {
-            case 1: { ffi_arg  v; memcpy(&v, buf, sizeof(v)); return Value((double)(uint8_t)v);  }
-            case 2: { ffi_arg  v; memcpy(&v, buf, sizeof(v)); return Value((double)(uint16_t)v); }
-            case 4: { uint32_t v; memcpy(&v, buf, 4);         return Value((double)v); }
-            case 8: { uint64_t v; memcpy(&v, buf, 8);         return Value((double)v); }
+            case 1: { ffi_arg  v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(uint8_t)v);  }
+            case 2: { ffi_arg  v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(uint16_t)v); }
+            case 4: { uint32_t v; memcpy(&v, buf, 4);         return Value((int64_t)v); }
+            case 8: { uint64_t v; memcpy(&v, buf, 8);         return Value((int64_t)v); }
         }
     }
     raiseError("ffi", "unmarshal: unsupported size " + std::to_string(sz));
@@ -278,13 +283,13 @@ static void marshalArg(const std::string&     context,
     if (isPtr) {
         if (!val.isPointer())
             raiseError(context, argLabel + ": expects ptr, got " + val.typeName());
-        void* p = val.asPointer();
+        void* p = val.asPointer().ptr;
         memcpy(slot, &p, sizeof(void*));
         return;
     }
 
     if (isFloat) {
-        if (!val.isNumber())
+        if (!val.isNumeric())
             raiseError(context, argLabel + ": expects " + tname + ", got " + val.typeName());
         double d = val.asNumber();
         if (sz == 4) { float f = (float)d; memcpy(slot, &f, 4); }
@@ -292,15 +297,22 @@ static void marshalArg(const std::string&     context,
         return;
     }
 
-    // integer
-    if (!val.isNumber())
+    // integer. prefer an already-exact int64 (e.g. from an int literal or a
+    // prior ffi_call's int-typed return) over a double round-trip so large
+    // 64-bit values don't lose precision on the way in.
+    if (!val.isNumeric())
         raiseError(context, argLabel + ": expects " + tname + ", got " + val.typeName());
-    double d  = val.asNumber();
-    int64_t iv = (int64_t)d;
-    if ((double)iv != d)
-        raiseError(context, argLabel + ": type " + tname +
-                   " is integer but got non-integer value " + std::to_string(d));
-    if (!isSigned && d < 0.0)
+    int64_t iv;
+    if (val.isInt()) {
+        iv = val.asInt();
+    } else {
+        double d = val.asNumber();
+        iv = (int64_t)d;
+        if ((double)iv != d)
+            raiseError(context, argLabel + ": type " + tname +
+                       " is integer but got non-integer value " + std::to_string(d));
+    }
+    if (!isSigned && iv < 0)
         raiseError(context, argLabel + ": type " + tname +
                    " is unsigned but got negative value");
     switch (sz) {
@@ -404,8 +416,7 @@ static void ffiClosureTrampoline(ffi_cif*  /*cif*/,
     for (size_t i = 0; i < entry->argInfo.size(); ++i)
         embrArgs.push_back(unmarshalReturn(entry->argInfo[i], argptrs[i]));
 
-    Runner r(*entry->interp);
-    Value result = r.invoke(entry->embrFn, embrArgs);
+    Value result = invoke(*entry->interp, entry->embrFn, embrArgs);
 
     // marshal the return value into retbuf.
     size_t rsz = entry->retInfo.size;
@@ -415,7 +426,7 @@ static void ffiClosureTrampoline(ffi_cif*  /*cif*/,
     bool isFloat = entry->retInfo.isFloat;
 
     if (isPtr) {
-        void* p = result.isPointer() ? result.asPointer() : nullptr;
+        void* p = result.isPointer() ? result.asPointer().ptr : nullptr;
         memcpy(retbuf, &p, sizeof(void*));
     } else if (isFloat && rsz == 4) {
         float f = (float)result.asNumber(); memcpy(retbuf, &f, 4);
@@ -455,7 +466,7 @@ static void* unwrapSym(const Value& v, const std::string& caller) {
     if (t == m.end() || t->second.asString() != "sym")
         raiseError(caller, "expected a symbol handle — got a different map "
                    "(lib handle? plain map?)");
-    return m.at("__fnptr").asPointer();
+    return m.at("__fnptr").asPointer().ptr;
 }
 
 
@@ -539,7 +550,7 @@ EMBR_PLUGIN {
         m["__type"]  = Value(std::string("sym"));
         m["__name"]  = Value(name);
         m["__lib"]   = Value(path);
-        m["__fnptr"] = Value(sym);
+        m["__fnptr"] = Value::makePointer(sym);
         return Value(std::move(m));
     });
 
@@ -819,7 +830,7 @@ EMBR_PLUGIN {
         Value::map_type m;
         m["__type"]  = Value(std::string("callback"));
         m["__key"]   = Value((double)key);
-        m["__fnptr"] = Value(raw->fnptr);  // pass this to C
+        m["__fnptr"] = Value::makePointer(raw->fnptr);  // pass this to C
         return Value(std::move(m));
     });
 
@@ -848,7 +859,7 @@ EMBR_PLUGIN {
     // there is no literal syntax for pointers in embr so this is the canonical way to produce one
     interp->bind("ptr_null",
     [](const std::vector<Value>&) -> Value {
-        return Value(nullptr);
+        return Value::makePointer(nullptr);
     });
 
     // ptr_offset(p, n: num) -> ptr
@@ -858,8 +869,8 @@ EMBR_PLUGIN {
     interp->bindSig("ptr_offset", {pPtr("p"), pOpt("n")},
     [](const std::vector<Value>& args) -> Value {
         ptrdiff_t off = args.size() > 1 ? (ptrdiff_t)args[1].asNumber() : 0;
-        uint8_t* base = static_cast<uint8_t*>(args[0].asPointer());
-        return Value(base + off);
+        uint8_t* base = static_cast<uint8_t*>(args[0].asPointer().ptr);
+        return Value::makePointer(base + off);
     });
 
     // ptr_read(p, desc: map) -> any
@@ -869,7 +880,7 @@ EMBR_PLUGIN {
     interp->bindSig("ptr_read", {pPtr("p"), pMap("desc")},
     [](const std::vector<Value>& args) -> Value {
         requireTypeDesc(args[1], "ptr_read", "desc");
-        void* p = args[0].asPointer();
+        void* p = args[0].asPointer().ptr;
         if (!p) raiseError("ptr_read", "cannot read from null pointer");
         return unmarshalReturn(resolveTypeInfo(args[1].asMap()), p);
     });
@@ -880,7 +891,7 @@ EMBR_PLUGIN {
     interp->bindSig("ptr_write", {pPtr("p"), pMap("desc"), pAny("val")},
     [](const std::vector<Value>& args) -> Value {
         requireTypeDesc(args[1], "ptr_write", "desc");
-        void* p = args[0].asPointer();
+        void* p = args[0].asPointer().ptr;
         if (!p) raiseError("ptr_write", "cannot write to null pointer");
 
         const auto& desc = args[1].asMap();
@@ -892,18 +903,18 @@ EMBR_PLUGIN {
         if (isPtr) {
             if (!v.isPointer())
                 raiseError("ptr_write", "value must be a pointer for ptr type");
-            void* q = v.asPointer();
+            void* q = v.asPointer().ptr;
             memcpy(p, &q, sizeof(void*));
         } else if (isFloat) {
-            if (!v.isNumber())
+            if (!v.isNumeric())
                 raiseError("ptr_write", "value must be a number for float type");
             double d = v.asNumber();
             if (sz == 4) { float f = (float)d; memcpy(p, &f, 4); }
             else          {                      memcpy(p, &d, 8); }
         } else {
-            if (!v.isNumber())
+            if (!v.isNumeric())
                 raiseError("ptr_write", "value must be a number for integer type");
-            int64_t iv = (int64_t)v.asNumber();
+            int64_t iv = v.isInt() ? v.asInt() : (int64_t)v.asNumber();
             switch (sz) {
                 case 1: { uint8_t  x=(uint8_t) iv; memcpy(p,&x,1); } break;
                 case 2: { uint16_t x=(uint16_t)iv; memcpy(p,&x,2); } break;

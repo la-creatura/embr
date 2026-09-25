@@ -15,6 +15,38 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# unit tests run through CTest (see tests/CMakeLists.txt) instead of one
+# hand-rolled embr_tests binary -- each plugin gets its own small, separately
+# buildable/runnable test executable
+include(CTest)
+
+# which execution backend(s) end up compiled into embr.h -- and therefore
+# into every target that links embr_single_header (embr itself, every
+# plugin, every test_* binary) -- is chosen here, not in the source tree.
+# see include/embr/backends/tree_walker.h and backends/vm.h: both are always
+# #include'd by core/root.h, but each one's *content* is a no-op unless its
+# own EMBR_WITH_* macro is defined, which happens via the DEFINES passed to
+# embr_amalgamate() below (baked in as #defines at the top of the generated
+# header). at least one must be on.
+option(EMBR_WITH_TREE_WALKER "Compile in the AST tree-walking backend" ON)
+option(EMBR_WITH_VM          "Compile in the bytecode VM backend"      OFF)
+
+if(NOT EMBR_WITH_TREE_WALKER AND NOT EMBR_WITH_VM)
+    message(FATAL_ERROR "at least one of EMBR_WITH_TREE_WALKER / EMBR_WITH_VM must be ON")
+endif()
+
+set(EMBR_BACKEND_DEFINES "")
+set(EMBR_BACKEND_NAMES   "")
+if(EMBR_WITH_TREE_WALKER)
+    list(APPEND EMBR_BACKEND_DEFINES EMBR_WITH_TREE_WALKER)
+    list(APPEND EMBR_BACKEND_NAMES   "tree-walker")
+endif()
+if(EMBR_WITH_VM)
+    list(APPEND EMBR_BACKEND_DEFINES EMBR_WITH_VM)
+    list(APPEND EMBR_BACKEND_NAMES   "vm")
+endif()
+list(JOIN EMBR_BACKEND_NAMES " + " EMBR_BACKEND_NAMES_STR)
+
 # embr.h is generated at build time from the modular sources under include/embr/{core,backends}/
 # edit the modular headers
 # every target below depends on the regenerated header and rebuilds it automatically.
@@ -26,15 +58,13 @@ embr_amalgamate(embr_single_header
     SOURCE_DIR         ${CMAKE_SOURCE_DIR}/include/embr
     INCLUDE_DIRS       ${CMAKE_SOURCE_DIR}/include
     PUBLIC_INCLUDE_DIR ${CMAKE_BINARY_DIR}/generated
-    BANNER             "embr - single header build (tree-walker backend)"
+    DEFINES            ${EMBR_BACKEND_DEFINES}
+    BANNER             "embr - single header build (backends: ${EMBR_BACKEND_NAMES_STR})"
 )
 # PUBLIC_INCLUDE_DIR is generated/ (not generated/embr/) so that the existing #include <embr/embr.h> keeps resolving
 
 add_executable(embr src/cli.cpp)
 target_link_libraries(embr PRIVATE embr_single_header)
-
-add_executable(embr_tests src/tests.cpp)
-target_link_libraries(embr_tests PRIVATE embr_single_header)
 
 target_compile_options(embr PRIVATE
     $<$<CONFIG:Release>:-O3>
@@ -64,7 +94,10 @@ else()
     set(BIN_DIR ${CMAKE_SOURCE_DIR}/bin/linux)
 endif()
 
-set_target_properties(embr       PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BIN_DIR}")
-set_target_properties(embr_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BIN_DIR}")
+set_target_properties(embr PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BIN_DIR}")
 
 add_subdirectory(plugins)
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

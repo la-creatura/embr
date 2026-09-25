@@ -59,10 +59,14 @@ private:
         int sl = line_, sc = col_; std::string t;
         while (!eof() && (std::isalnum((unsigned char)peek()) || peek() == '_')) t += get();
         static const std::unordered_map<std::string, TokenType> kw = {
-            {"if",TokenType::If},        {"else",TokenType::Else},    {"end",TokenType::End},
+            {"if",TokenType::If},        {"elif",TokenType::Elif},    {"else",TokenType::Else},
+            {"end",TokenType::End},
             {"fn",TokenType::Fn},        {"return",TokenType::Return},{"while",TokenType::While},
-            {"import",TokenType::Import},{"local",TokenType::Local},
+            {"for",TokenType::For},      {"in",TokenType::In},
+            {"break",TokenType::Break},  {"continue",TokenType::Continue},
+            {"import",TokenType::Import},{"local",TokenType::Local},{"auto",TokenType::Auto},
             {"and",TokenType::And},      {"or",TokenType::Or},
+            {"try",TokenType::Try},      {"catch",TokenType::Catch},
         };
         auto it = kw.find(t);
         return {it != kw.end() ? it->second : TokenType::Identifier, t, sl, sc};
@@ -119,7 +123,13 @@ private:
             case '}': return {TokenType::RCurly,  "}",sl,sc};
 
             case ',': return {TokenType::Comma,   ",",sl,sc};
-            case '.': return {TokenType::Dot,     ".",sl,sc};
+            case '.':
+                if (peek()=='.') {
+                    get();
+                    if (peek()=='.') { get(); return {TokenType::Ellipsis, "...", sl, sc}; }
+                    raiseError("lexer","unexpected '..' (did you mean '...'?)",{sl,sc,line_,col_},map_);
+                }
+                return {TokenType::Dot, ".", sl, sc};
             case ':': return {TokenType::Colon,   ":",sl,sc};
 
             case '=': if(peek()=='='){get();return{TokenType::EqualEqual,  "==",sl,sc};} return{TokenType::Equal,  "=",sl,sc};
