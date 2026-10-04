@@ -1,0 +1,22 @@
+{
+  "name": "embr-language",
+  "displayName": "embr",
+  "description": "Syntax highlighting and basic editing support for the embr scripting language (.embr)",
+  "version": "0.1.0",
+  "publisher": "embr",
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "embr",
+        "aliases": ["embr", "Embr"],
+        "extensions": [".embr"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      { "language": "embr", "scopeName": "source.embr", "path": "./syntaxes/embr.tmLanguage.json" }
+    ]
+  }
+}

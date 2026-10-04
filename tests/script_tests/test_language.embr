@@ -1,0 +1,131 @@
+# language-level tests written in embr itself and run by `embr test` on both backends
+import "testing.embr"
+
+fn test_int_and_float_are_different_types()
+    assert_eq(type(5), "int")
+    assert_eq(type(5.0), "number")
+    assert_eq(7 / 2, 3.5)
+    assert_eq(7 % 2, 1)
+end
+
+fn test_int_overflow_widens_to_float()
+    big = 9223372036854775807
+    assert_eq(type(big + 0), "int")
+    assert_eq(type(big + 1), "number")
+    assert_eq(type(big * 2), "number")
+    low = -big - 1
+    assert_eq(low % -1, 0)
+end
+
+fn test_exponent_and_escape_literals()
+    assert_eq(1e3, 1000)
+    assert_eq(type(1e3), "number")
+    assert_eq(2.5e-3, 0.0025)
+    assert_eq(len("é"), 2)
+    assert_eq(len("\xff"), 1)
+    assert_eq("\u{41}", "A")
+end
+
+fn test_function_locals_do_not_leak()
+    fn leak()
+        fresh = 42
+        return fresh
+    end
+    assert_eq(leak(), 42)
+    e = assert_raises(fn() return fresh end)
+    assert_true(len(e["message"]) > 0)
+end
+
+fn test_closures_share_captured_state()
+    fn make()
+        n = 0
+        return fn()
+            n = n + 1
+            return n
+        end
+    end
+    a = make()
+    b = make()
+    a()
+    a()
+    assert_eq(a(), 3)
+    assert_eq(b(), 1)
+end
+
+fn test_callable_equality_is_identity()
+    fn f(x) return x end
+    g = f
+    h = fn(x) return x end
+    assert_true(f == g)
+    assert_false(f == h)
+    assert_false(h == fn(x) return x end)
+end
+
+fn test_error_trace_has_call_site_lines()
+    fn inner()
+        error("boom")
+    end
+    fn outer()
+        inner()
+    end
+    e = assert_raises(fn() outer() end)
+    assert_eq(e["message"], "boom")
+    assert_true(len(e["trace"]) >= 2)
+    assert_eq(e["trace"][0]["fn"], "inner")
+    assert_eq(e["trace"][1]["fn"], "outer")
+end
+
+fn test_equality_is_structural_for_arrays_and_maps()
+    assert_eq([1, [2, 3]], [1, [2, 3]])
+    assert_eq({"a": [1]}, {"a": [1]})
+    assert_ne([1, 2], [2, 1])
+end
+
+fn test_top_level_break_continue_in_loops()
+    total = 0
+    for i in [1, 2, 3, 4, 5, 6]
+        if i == 2
+            continue
+        end
+        if i == 5
+            break
+        end
+        total += i
+    end
+    assert_eq(total, 1 + 3 + 4)
+end
+
+fn test_value_nesting_limit_is_an_error_not_a_crash()
+    # building anything nested deeper than 1000 levels raises a catchable error (it used to overflow the
+    # native stack and kill the process); a value just under the limit must still be fully usable
+    a = []
+    i = 0
+    while i < 990
+        a = [a]
+        i += 1
+    end
+    assert_true(len(str(a)) > 0)
+    assert_eq(a, a)
+    b = a
+    assert_eq(b, a)
+    e = assert_raises(fn()
+        deeper = a
+        j = 0
+        while j < 100
+            deeper = [deeper]
+            j += 1
+        end
+    end)
+    assert_true(len(e["message"]) > 0)
+    m = {}
+    k = 0
+    e2 = assert_raises(fn()
+        mm = {}
+        n = 0
+        while n < 5000
+            mm = {"k": mm}
+            n += 1
+        end
+    end)
+    assert_true(len(e2["message"]) > 0)
+end

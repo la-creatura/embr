@@ -6,7 +6,8 @@ flatten a tree of local #include "..." headers into a single distributable heade
 NOT a preprocessor. it only recursively inlines local quoted #include directives in dependency order, and:
 1. puts every #include <...> to the top of the output, deduplicated, in original order.
 2. inlines each local header's contents exactly once.
-3. emits #line directives around each inlined chunk so compiler errors, warnings and debugger stepping still point at the real modular source files, not line 4821 of the generated header.
+3. emits #line directives around each inlined chunk, so compiler errors, warnings and debugger stepping still point
+   at the real modular source files, not line 4821 of the generated header.
 4. leaves every #ifdef/#define/comment/whatever completely untouched.
 
 usage:

@@ -1,0 +1,28 @@
+# requires: vm
+# cooperative coroutines (only available when running under `embr --vm`)
+import "coroutine"
+
+fn counter(start)
+    local n = start
+    while 1
+        local step = coroutine_yield(n)
+        n = n + step
+    end
+end
+
+local co = coroutine_create(counter)
+print(coroutine_status(co))
+print(coroutine_resume(co, 10))
+print(coroutine_resume(co, 1))
+print(coroutine_resume(co, 5))
+print(coroutine_status(co))
+
+# a coroutine that finishes hands back its return value and is then dead
+fn once()
+    coroutine_yield("paused")
+    return "done"
+end
+local job = coroutine_create(once)
+print(coroutine_resume(job))
+print(coroutine_resume(job))
+print(coroutine_status(job))

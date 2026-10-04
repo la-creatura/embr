@@ -1,6 +1,8 @@
 #ifndef EMBR_CORE_PARSER_H
 #define EMBR_CORE_PARSER_H
 
+#include <algorithm>
+#include <initializer_list>
 #include "diagnostics.h"
 #include "types.h"
 #include "token.h"
@@ -19,21 +21,62 @@ public:
     Parser(std::vector<Token> toks, SourceMap src)
         : toks_(std::move(toks)), src_(std::move(src)) {}
 
+    // by default parse errors are printed to std::cerr as they are found (the parser recovers and keeps
+    // going, so one bad statement doesn't hide the rest). a tool that wants them as data, `embr check`,
+    // an editor/LSP integration, passes a vector here and they are appended to it instead, nothing printed
+    void collectErrors(std::vector<EmbrError>* sink) { errors_ = sink; }
+
     std::vector<StmtPtr> parse() {
         std::vector<StmtPtr> out;
         while (!check(TokenType::Eof)) {
             try { out.push_back(stmt()); }
-            catch (const EmbrError& e) { std::cerr << e.what(); sync(); }
-            catch (const std::exception& e) { std::cerr << "[parser] " << e.what() << "\n"; sync(); }
+            catch (const EmbrError& e) { report(e); loopDepth_ = 0; sync(); }
+            catch (const std::exception& e) {
+                report(EmbrError(std::string("[parser] ") + e.what() + "\n", false, {}, e.what(), "parser"));
+                loopDepth_ = 0; sync();
+            }
         }
         return out;
     }
 
 private:
+    std::vector<EmbrError>* errors_ = nullptr;     // see collectErrors()
+    void report(const EmbrError& e) { if (errors_) errors_->push_back(e); else std::cerr << e.what(); }
+
     std::vector<Token> toks_;
     SourceMap          src_;
     size_t             i_ = 0;
     int                loopDepth_ = 0; // reset across fn/lambda boundaries so break/continue can't cross them
+
+    // hard limits that turn a native stack overflow (an uncatchable process kill) on pathological input into
+    // an ordinary parser error. both are far above what real code needs and far below where an 8 MB stack gives out
+    // parse()'s error recovery also resets loopDepth_ to 0, because a statement that throws midway skips the
+    // matching restore. without that, a stray `continue` after an error was accepted with no loop to attach to
+    static constexpr int kMaxNesting   = 2500;   // simultaneous recursive parse calls (stmt/expr/unary)
+    static constexpr int kMaxExprDepth = 4000;   // height of any single expression tree
+    int                nest_ = 0;
+
+    struct NestGuard {
+        Parser& p;
+        explicit NestGuard(Parser& p_) : p(p_) {
+            if (++p.nest_ > kMaxNesting) {
+                --p.nest_;
+                raiseError("parser", "nesting too deep (max " + std::to_string(kMaxNesting) + ")",
+                           SourceRange::fromToken(p.peek()), p.src_);
+            }
+        }
+        ~NestGuard() { --p.nest_; }
+    };
+
+    // records n's tree height from its children and enforces kMaxExprDepth
+    void setDepth(Expr* n, std::initializer_list<const Expr*> kids) {
+        int d = 0;
+        for (const Expr* k : kids) if (k && k->depth > d) d = k->depth;
+        n->depth = d + 1;
+        if (n->depth > kMaxExprDepth)
+            raiseError("parser", "expression too deeply nested or too long (max depth " +
+                       std::to_string(kMaxExprDepth) + ")", n->range, src_);
+    }
 
     Token& peek() { return toks_[i_]; }
     Token& prev() { return toks_[i_-1]; }
@@ -109,6 +152,7 @@ private:
     }
 
     StmtPtr stmt() {
+        NestGuard guard(*this);
         if (match(TokenType::If))       return parseIf();
         if (match(TokenType::While))    return parseWhile();
         if (match(TokenType::For))      return parseFor();
@@ -464,15 +508,21 @@ private:
         return s;
     }
 
+    // import <expr>
+    // path is a full expression (not just a string literal) so a script can
+    // compute its own import path exactly like it already can for
+    // load_module(), e.g. `import "plugins/" + name`
     StmtPtr parseImport() {
         SourceRange start = tr(prev());
-        Token path = consume(TokenType::String, "expected string path after 'import'");
+        auto pathExpr = expr();
         auto s = std::make_unique<ImportStmt>();
-        s->path = path.text; s->range = SourceRange::merge(start, tr(path));
+        s->range = SourceRange::merge(start, pathExpr->range);
+        s->pathExpr = std::move(pathExpr);
         return s;
     }
 
     ExprPtr expr(int minPrec = 0) {
+        NestGuard guard(*this);
         ExprPtr left = unary();
         while (true) {
             if (minPrec <= 0 && check(TokenType::Or)) {
@@ -482,6 +532,7 @@ private:
                 log->range = SourceRange::merge(left->range, right->range);
                 log->left  = std::move(left);
                 log->right = std::move(right);
+                setDepth(log.get(), {log->left.get(), log->right.get()});
                 left = std::move(log);
                 continue;
             }
@@ -492,6 +543,7 @@ private:
                 log->range = SourceRange::merge(left->range, right->range);
                 log->left  = std::move(left);
                 log->right = std::move(right);
+                setDepth(log.get(), {log->left.get(), log->right.get()});
                 left = std::move(log);
                 continue;
             }
@@ -504,17 +556,35 @@ private:
             bin->left = std::move(left);
             bin->right = expr(prec + 1);
             bin->range = SourceRange::merge(bin->left->range, bin->right->range);
+            setDepth(bin.get(), {bin->left.get(), bin->right.get()});
             left = std::move(bin);
         }
         return left;
     }
 
+    // `&target` as a call argument, the `&` already consumed. the target must be a variable or an element of one
+    ExprPtr refArg(const Token& amp) {
+        auto target = unary();
+        const Expr* root = target.get();
+        while (root->kind == Expr::Kind::Index) root = static_cast<const IndexExpr*>(root)->object.get();
+        if (root->kind != Expr::Kind::Var)
+            raiseError("parser", "'&' needs a variable or an element of one, like &list or &grid[i]",
+                       SourceRange::merge(tr(amp), target->range), src_);
+        auto r = std::make_unique<RefExpr>();
+        r->range = SourceRange::merge(tr(amp), target->range);
+        setDepth(r.get(), {target.get()});
+        r->target = std::move(target);
+        return r;
+    }
+
     ExprPtr unary() {
+        NestGuard guard(*this);
         if (match(TokenType::Minus) || match(TokenType::Bang)) {
             Token op = prev(); auto right = unary();
             auto u = std::make_unique<UnaryExpr>();
             u->op = op.text; u->right = std::move(right);
             u->range = SourceRange::merge(tr(op), u->right->range);
+            setDepth(u.get(), {u->right.get()});
             return u;
         }
         auto expr_ = primary();
@@ -526,7 +596,7 @@ private:
 
                 if (!check(TokenType::RParen))
                     do {
-                        call->args.push_back(expr());
+                        call->args.push_back(match(TokenType::Amp) ? refArg(prev()) : expr());
                     } while (match(TokenType::Comma));
 
                 Token rp = consume(TokenType::RParen, "expected ')'");
@@ -534,15 +604,24 @@ private:
                     call->callee->range,
                     tr(rp)
                 );
+                {
+                    int d = call->callee->depth;
+                    for (auto& a : call->args) d = std::max(d, a->depth);
+                    call->depth = d + 1;
+                    if (call->depth > kMaxExprDepth)
+                        raiseError("parser", "expression too deeply nested or too long (max depth " +
+                                   std::to_string(kMaxExprDepth) + ")", call->range, src_);
+                }
 
                 expr_ = std::move(call);
             }
-            if (match(TokenType::LBracket)) {
+            else if (match(TokenType::LBracket)) {
                 auto idx = std::make_unique<IndexExpr>();
                 idx->object = std::move(expr_);
                 idx->index = expr();
                 Token rb = consume(TokenType::RBracket, "expected ']'");
                 idx->range = SourceRange::merge(idx->object->range, tr(rb));
+                setDepth(idx.get(), {idx->object.get(), idx->index.get()});
                 expr_ = std::move(idx);
             }
             else if (match(TokenType::Dot)) {
@@ -553,6 +632,7 @@ private:
                 auto keyExpr = std::make_unique<StringExpr>(id.text, SourceRange::fromToken(id));
                 idx->index = std::move(keyExpr);
                 idx->range = SourceRange::merge(idx->object->range, SourceRange::fromToken(id));
+                setDepth(idx.get(), {idx->object.get(), idx->index.get()});
                 expr_ = std::move(idx);
             }
             else {
@@ -594,7 +674,13 @@ private:
                     do { arr->elements.push_back(expr()); }
                     while (match(TokenType::Comma) && !check(TokenType::RBracket));
                 Token rb = consume(TokenType::RBracket, "expected ']'");
-                arr->range = SourceRange::merge(r, tr(rb)); return arr;
+                arr->range = SourceRange::merge(r, tr(rb));
+                { int d = 0; for (auto& el : arr->elements) d = std::max(d, el->depth);
+                  arr->depth = d + 1;
+                  if (arr->depth > kMaxExprDepth)
+                      raiseError("parser", "expression too deeply nested or too long (max depth " +
+                                 std::to_string(kMaxExprDepth) + ")", arr->range, src_); }
+                return arr;
             }
             case TokenType::LCurly: {
                 auto map = std::make_unique<MapExpr>();
@@ -610,7 +696,13 @@ private:
                     } while (match(TokenType::Comma) && !check(TokenType::RCurly));
                 }
                 Token rc = consume(TokenType::RCurly, "expected '}'");
-                map->range = SourceRange::merge(r, tr(rc)); return map;
+                map->range = SourceRange::merge(r, tr(rc));
+                { int d = 0; for (auto& kv : map->entries) d = std::max({d, kv.first->depth, kv.second->depth});
+                  map->depth = d + 1;
+                  if (map->depth > kMaxExprDepth)
+                      raiseError("parser", "expression too deeply nested or too long (max depth " +
+                                 std::to_string(kMaxExprDepth) + ")", map->range, src_); }
+                return map;
             }
             // fn(params) body end
             case TokenType::Fn: {
@@ -630,6 +722,10 @@ private:
                 return lam;
             }
             default:
+                // primary() advanced past `tok` unconditionally above; if that was the Eof sentinel,
+                // put it back so the error-recovery sync() in parse() doesn't read one past the end
+                // of the token vector (found by tools/fuzz: a bare `return` at end of input).
+                if (tok.type == TokenType::Eof) --i_;
                 raiseError("parser", "unexpected token '" + tok.text + "'", r, src_);
         }
     }

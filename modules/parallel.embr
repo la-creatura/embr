@@ -1,0 +1,120 @@
+# parallel.embr -- worker_map, a worker-pool "map" built on plugins/parallel's raw primitives
+# (channel/worker_spawn/worker_join)
+#
+# usage
+#   import "parallel.embr"
+#   results = worker_map("worker.embr", "process", [1,2,3,4,5,6], 3)
+#   # runs process(x) once per element of the input array, 3 workers at a time, and returns the results in the
+#   # SAME order as the input
+#
+# worker.embr just needs to export a plain function of one argument:
+#   fn process(x)
+#       return x * x
+#   end
+#
+# how it works: the input is split into n_workers contiguous chunks (as even as possible), and each worker gets its
+# own in/out channel pair for its chunk. a worker handles its chunk in order, so its results come back in order, and
+# joining the chunks in worker order rebuilds the input order. the split is static: a worker that finishes early
+# idles instead of taking another's work. that's fine for equal-sized tasks. for uneven costs, build a shared work
+# queue from plugins/parallel's channel() directly
+#
+# one failed task aborts the whole worker_map call (it raises with that task's error message) instead of
+# returning partial results
+
+import "parallel"
+import "embrlib"
+
+fn worker_map(module_path, fn_name, inputs, n_workers)
+    n = len(inputs)
+    if n == 0
+        return []
+    end
+    if n_workers > n
+        n_workers = n
+    end
+    if n_workers < 1
+        n_workers = 1
+    end
+
+    return __parallel_worker_map_impl(module_path, fn_name, inputs, n_workers)
+end
+
+# split n items across n_workers as evenly as possible: the first
+# (n mod n_workers) workers get one extra item. returns an array of
+# per-worker counts summing to n.
+fn __parallel_chunk_counts(n, n_workers)
+    base = 0
+    rem = n
+    q = 0
+    # integer division/modulo via while loops (embr has no int-division operator)
+    while rem >= n_workers
+        rem = rem - n_workers
+        q = q + 1
+    end
+    # q = n / n_workers (floor), rem = n mod n_workers
+    counts = []
+    i = 0
+    while i < n_workers
+        c = q
+        if i < rem
+            c = c + 1
+        end
+        counts = push(counts, c)
+        i = i + 1
+    end
+    return counts
+end
+
+fn __parallel_worker_map_impl(module_path, fn_name, inputs, n_workers)
+    counts = __parallel_chunk_counts(len(inputs), n_workers)
+
+    workers  = []
+    in_chs   = []
+    out_chs  = []
+    w = 0
+    while w < n_workers
+        in_ch  = channel()
+        out_ch = channel()
+        workers = push(workers, worker_spawn(module_path, fn_name, in_ch, out_ch))
+        in_chs  = push(in_chs, in_ch)
+        out_chs = push(out_chs, out_ch)
+        w = w + 1
+    end
+
+    idx = 0
+    w = 0
+    while w < n_workers
+        c = 0
+        while c < counts[w]
+            channel_send(in_chs[w], inputs[idx])
+            idx = idx + 1
+            c = c + 1
+        end
+        channel_close(in_chs[w])
+        w = w + 1
+    end
+
+    results = []
+    w = 0
+    while w < n_workers
+        c = 0
+        while c < counts[w]
+            r = channel_recv(out_chs[w])
+            if r["ok"] == 1
+                results = push(results, r["value"])
+            else
+                error("worker_map: task failed: " + r["error"]["message"])
+            end
+            c = c + 1
+        end
+        w = w + 1
+    end
+
+    w = 0
+    while w < n_workers
+        worker_join(workers[w])
+        w = w + 1
+    end
+
+    return results
+end

@@ -1,0 +1,239 @@
+# ffi.embr -- call C functions from C declarations. an embr script module on top of the native ffi/embrtypes
+# plugins and plugins/embrmeta
+#
+# usage
+#   import "ffi.embr"
+#   lib = ffi_open("libraylib.so")
+#   ffi_cdef(lib, "void InitWindow(int width, int height, const char *title);")
+#   ffi_cdef(lib, "bool WindowShouldClose(void);")
+#   InitWindow(800, 450, "hello")
+#   while !WindowShouldClose()
+#       ...
+#   end
+#
+# ffi_cdef(lib, decl) parses one C function declaration, turns its return/parameter types into embrtypes
+# descriptors, prepares the call once (ffi_prepare/ffi_prepare_var), and installs a global function under the
+# declaration's own name, so InitWindow becomes callable as if a plugin had bound it. installing under a name
+# known only at runtime is what plugins/embrmeta's meta_set() is for
+#
+# supported C types: void (return only), bool, char/short/int/long/long long (signed and unsigned, with or without
+# the trailing "int"), float, double, size_t/ssize_t, the stdint.h names (int32_t, uint8_t, ...), any pointer
+# (T* is a generic pointer, except `const char *`, which is marshaled as a real C string; a non-const `char *`
+# stays a generic pointer, see __ffi_resolve_base), and "..." as a trailing variadic marker
+#
+# structs and typedefs are NOT parsed from C syntax (that needs a real C parser). register any non-primitive type
+# name yourself with ffi_typedef() before using it in a declaration:
+#
+#   ffi_typedef("Color", struct_type([["r", type_u8()], ["g", type_u8()],
+#                                     ["b", type_u8()], ["a", type_u8()]]))
+#   ffi_cdef(raylib, "void ClearBackground(Color color);")
+#   ClearBackground({"r": 255, "g": 255, "b": 255, "a": 255})
+#
+# a struct argument is a MAP with the descriptor's field names, not a positional array (that's how struct_type()
+# and the ffi plugin already work, see tests/ffi_test.cpp)
+#
+# the helpers below are plain top-level bindings, not `local`. making __ffi_typedefs `local` would work today too
+# (closures share the live scope, see CaptureFrame in core/value.h, so exported functions see each other's writes),
+# but a plain binding is simpler. the double underscore is only a naming convention for "internal"
+
+import "embrtypes"
+import "embrmeta"
+import "ffi"
+import "regex"
+import "str"
+import "embrlib"
+
+# name -> embrtypes descriptor, for types ffi_cdef can't resolve on its own
+# (struct typedefs, or a plain alias for a primitive). populated by ffi_typedef().
+__ffi_typedefs = {}
+
+# ffi_typedef(name: str, desc: any) -> 0
+# registers desc (an embrtypes type descriptor, e.g. from struct_type() or
+# any type_*() call) under name, so a later ffi_cdef() declaration can refer
+# to it by that name (a C typedef or struct tag).
+fn ffi_typedef(name, desc)
+    __ffi_typedefs[name] = desc
+    return 0
+end
+
+# normalized base-type keyword ("unsigned long" -> "unsignedlong", stars stripped and counted) -> its embrtypes scalar
+# descriptor constructor
+# "bool" maps to an unsigned byte, not embrtypes' type_bool() (that means a bool-tagged pointer, true()/false()'s own
+# representation, not a 1-byte C value; embrtypes.h has no Bool kind). C's _Bool as a plain byte is exact, and the
+# returned 0/1 works as a truthy value
+__ffi_base_types = {
+    "bool": type_u8,
+    "char": type_i8, "signedchar": type_i8, "unsignedchar": type_u8,
+    "short": type_i16, "shortint": type_i16,
+    "signedshort": type_i16, "signedshortint": type_i16,
+    "unsignedshort": type_u16, "unsignedshortint": type_u16,
+    "int": type_i32, "signed": type_i32, "signedint": type_i32,
+    "unsigned": type_u32, "unsignedint": type_u32,
+    "long": type_i64, "longint": type_i64,
+    "signedlong": type_i64, "signedlongint": type_i64,
+    "unsignedlong": type_u64, "unsignedlongint": type_u64,
+    "longlong": type_i64, "longlongint": type_i64,
+    "signedlonglong": type_i64, "signedlonglongint": type_i64,
+    "unsignedlonglong": type_u64, "unsignedlonglongint": type_u64,
+    "float": type_f32,
+    "double": type_f64,
+    "size_t": type_u64,
+    "ssize_t": type_i64,
+    "int8_t": type_i8, "int16_t": type_i16, "int32_t": type_i32, "int64_t": type_i64,
+    "uint8_t": type_u8, "uint16_t": type_u16, "uint32_t": type_u32, "uint64_t": type_u64,
+}
+
+# raw -> [normalized_base_string, star_count, had_const]. drops const/struct/volatile (remembering whether "const"
+# was there, which __ffi_resolve_base uses to tell "char *" apart) and counts '*' separately from the other word
+# tokens, so callers don't depend on how the text was spaced
+__ffi_norm_type = fn(raw)
+    s = raw
+    had_const = len(re_find_all(s, "\\bconst\\b")) > 0
+    s = re_replace(s, "\\bconst\\b", "")
+    s = re_replace(s, "\\bstruct\\b", "")
+    s = re_replace(s, "\\bvolatile\\b", "")
+    stars = len(re_find_all(s, "\\*"))
+    s = re_replace(s, "\\*", " ")
+    s = str_strip(re_replace(s, "\\s+", " "))
+    return [s, stars, had_const]
+end
+
+# resolves an already-split (base, star_count, had_const) triple to a type descriptor. used for return types and
+# (after the name is stripped) parameter types
+#
+# "const char *" vs plain "char *" is the one place a C qualifier changes the type instead of being dropped. a
+# `const char *` is nearly always a null-terminated string argument (a name, a format string), so it marshals as a
+# C string. a non-const `char *` is just as often a raw output buffer (snprintf's first argument) that the caller
+# fills with buffer()/ptr_write(), so it marshals as a plain pointer. C can't tell these apart in general, so this
+# is a deliberate default, not a complete answer
+__ffi_resolve_base = fn(base, stars, had_const)
+    key = re_replace(base, "\\s+", "")
+    if stars > 0
+        if key == "char" and stars == 1 and had_const
+            return type_str()
+        end
+        return type_ptr()
+    end
+    if has(__ffi_base_types, key)
+        ctor = __ffi_base_types[key]
+        return ctor()
+    end
+    if has(__ffi_typedefs, key)
+        return __ffi_typedefs[key]
+    end
+    error("ffi_cdef: unknown C type '" + base + "' -- register it first with ffi_typedef(\"" + base + "\", ...)")
+end
+
+__ffi_resolve_return = fn(raw)
+    parts = __ffi_norm_type(raw)
+    s = parts[0]
+    stars = parts[1]
+    if s == "void" and stars == 0
+        return nil
+    end
+    return __ffi_resolve_base(s, stars, parts[2])
+end
+
+# a parameter entry ("const char *title", "int width", or a bare "int" with
+# no name), drops the trailing identifier (the parameter's own name, which
+# this module has no use for; ffi_call/ffi_invoke marshal positionally) when
+# there is one, then resolves what's left as a type.
+__ffi_resolve_param = fn(raw)
+    parts = __ffi_norm_type(raw)
+    s = parts[0]
+    stars = parts[1]
+    words = []
+    for w in str_split(s, " ")
+        if len(w) > 0
+            words = push(words, w)
+        end
+    end
+    base = ""
+    if len(words) >= 2
+        base = join(slice(words, 0, len(words) - 1), " ")
+    else
+        base = join(words, " ")
+    end
+    return __ffi_resolve_base(base, stars, parts[2])
+end
+
+# libffi bakes a variadic call's total argument count and every argument's type (fixed and variadic) into the cif at
+# prepare time (see ffi_prepare_var in ffi.cpp), so one cached prepared call only works for exactly the same number
+# and types of trailing arguments. a real variadic wrapper (snprintf, with a different format and count each time)
+# can't use one cached ffi_prepare_var. so for a variadic declaration the generated wrapper does a fresh
+# ffi_call_var on every call, inferring each variadic argument's C type from the embr value, using C's default
+# promotions: a string is a C string, a pointer is a pointer, an int is a 32-bit int (an embr int that doesn't fit
+# in 32 bits marshals wrong), anything else (a float) is a double. there is no way to override this per call
+__ffi_infer_vararg_type = fn(v)
+    t = type(v)
+    if t == "string"
+        return type_str()
+    end
+    if t == "pointer"
+        return type_ptr()
+    end
+    if t == "int"
+        return type_i32()
+    end
+    return type_f64()
+end
+
+# matches "RETTYPE NAME(PARAMS)" with an optional trailing ';'. the non-greedy return-type group only stops growing
+# where \s+(\w+)\s*\( really matches, which for a well-formed declaration is the function's name (no earlier
+# identifier in the return type/qualifiers is followed by '(')
+__ffi_decl_pattern = "^\\s*(.+?)\\s+(\\w+)\\s*\\(\\s*(.*?)\\s*\\)\\s*;?\\s*$"
+
+# ffi_cdef(lib: ptr<ffi.lib>, decl: str) -> 0
+# parses decl as a single C function declaration, resolves its signature,
+# and installs a global function under its name that calls into lib via
+# ffi_invoke(). see this file's header comment for what's supported.
+fn ffi_cdef(lib, decl)
+    m = re_match(decl, __ffi_decl_pattern)
+    if len(m) == 0
+        error("ffi_cdef: could not parse declaration: " + decl)
+    end
+
+    ret_raw    = m[1]
+    name       = m[2]
+    params_raw = m[3]
+
+    ret_desc  = __ffi_resolve_return(ret_raw)
+    arg_descs = []
+    variadic  = 0
+    nfixed    = 0
+
+    if params_raw != "" and params_raw != "void"
+        for entry in str_split(params_raw, ",")
+            p = str_strip(entry)
+            if p == "..."
+                variadic = 1
+            else
+                if variadic == 1
+                    error("ffi_cdef: fixed parameters cannot follow '...' in: " + decl)
+                end
+                arg_descs = push(arg_descs, __ffi_resolve_param(p))
+                nfixed = nfixed + 1
+            end
+        end
+    end
+
+    sym = ffi_sym(lib, name)
+
+    if variadic == 1
+        # see __ffi_infer_vararg_type's comment for why this can't be
+        # prepared once up front the way the non-variadic path below is
+        meta_set(name, fn(...args)
+            all_types = arg_descs
+            i = nfixed
+            while i < len(args)
+                all_types = push(all_types, __ffi_infer_vararg_type(args[i]))
+                i = i + 1
+            end
+            return ffi_call_var(sym, ret_desc, all_types, args, nfixed)
+        end)
+    else
+        prep = ffi_prepare(sym, ret_desc, arg_descs)
+        meta_set(name, fn(...args) return ffi_invoke(prep, args) end)
+    end
+    return 0
+end

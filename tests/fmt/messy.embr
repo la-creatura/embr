@@ -1,0 +1,39 @@
+# header comment
+x=1+2   # trailing
+   y = -x*3 - -1
+s = "a # not a comment"   #real comment
+fn add(a:num,b:num)->num
+return a+b
+end
+if x>1 and !y
+print( "hi" ,x )
+  elif x==2
+ print(  [1,2,3][0] )
+else
+print({"a":1,
+"b":[1,
+2]})
+end
+
+
+#[ block
+   comment ]#
+f = fn(a) return a+1 end
+z = f(1) #[ inline ]# + 2
+for i in [1,2]
+  print(i)   #c
+  # own line before end
+end
+run(fn(v)
+total = v
+while total < 3
+total += 1
+end
+end)
+try
+error("x")
+catch e
+print(e["message"])
+end
+g(a, b) = a
+print (f (1))

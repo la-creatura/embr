@@ -17,6 +17,7 @@ enum class TokenType {
     Equal,  EqualEqual,
     Greater, Less, GreaterEqual, LessEqual,
     Bang, BangEqual,
+    Amp,
     LArrow, RArrow,
     And, Or,
     If, Elif, Else, End, Fn, Return, While, For, In, Break, Continue, Import, Local, Auto,

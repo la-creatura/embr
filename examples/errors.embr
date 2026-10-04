@@ -1,0 +1,47 @@
+# errors are values you can catch; every error is a map with message, kind and line
+import "embrlib"
+
+try
+    error("something broke")
+catch e
+    print(e["message"])
+    print(e["kind"])
+end
+
+# runtime errors (division by zero, bad index, wrong types) are catchable too
+try
+    print(1 / 0)
+catch e
+    print("caught: " + e["message"])
+end
+
+try
+    x = [1, 2, 3]
+    print(x[10])
+catch e
+    print("caught an out-of-range index")
+end
+
+# assert raises when its condition is falsy
+try
+    assert(1 == 2, "math is broken")
+catch e
+    print(e["message"])
+end
+
+# a catch block lets the script keep going
+fn risky(n)
+    if n < 0
+        error("negative: " + str(n))
+    end
+    return n * 2
+end
+results = []
+for n in [3, -1, 4]
+    try
+        results = push(results, risky(n))
+    catch e
+        results = push(results, e["message"])
+    end
+end
+print(results)

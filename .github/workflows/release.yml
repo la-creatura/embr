@@ -1,0 +1,45 @@
+# release for embr. runs when a tag like v1.0.0 is pushed: builds the linux-vm-release preset (both backends),
+# runs the tests, packs embr-<version>-linux-<arch>.tar.gz (see the CPACK_* lines in CMakeLists.txt), and
+# attaches it and the single header (embr.h) to a GitHub release.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# the tag has to match project(embr VERSION ...) in CMakeLists.txt, or the job stops before building.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: tag matches CMakeLists.txt
+        run: |
+          want="$(sed -n 's/^project(embr VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          [ "v$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match CMake version $want"; exit 1; }
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
+      - name: configure
+        run: cmake --preset linux-vm-release -DCMAKE_CXX_FLAGS=-Werror
+      - name: build
+        run: cmake --build build/linux-vm-release -j"$(nproc)"
+      - name: test
+        run: ctest --test-dir build/linux-vm-release -j"$(nproc)" --output-on-failure --timeout 120
+      - name: package
+        run: cmake --build build/linux-vm-release --target package
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build/linux-vm-release/generated/embr/embr.h embr.h
+          gh release create "$GITHUB_REF_NAME" --generate-notes \
+            build/linux-vm-release/embr-*.tar.gz embr.h

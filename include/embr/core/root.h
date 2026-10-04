@@ -23,6 +23,7 @@
 #include "ast.h"
 #include "parser.h"
 #include "registry.h"
+#include "module.h"
 #include "../backends/tree_walker.h"
 #include "../backends/vm.h"
 #include "invoke.h"

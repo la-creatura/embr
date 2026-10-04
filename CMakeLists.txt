@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(embr LANGUAGES CXX)
+project(embr VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,19 +15,25 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# unit tests run through CTest (see tests/CMakeLists.txt) instead of one
-# hand-rolled embr_tests binary -- each plugin gets its own small, separately
-# buildable/runnable test executable
+# the docs live in the GitHub wiki, which is the git submodule in wiki/ (git submodule update --init). CTest uses it
+# to check the docs. to use another clone instead:  cmake --preset linux-vm-debug -DEMBR_WIKI_DIR=../some-clone
+# (the env var of the same name works too). if neither exists the wiki checks are skipped
+if(NOT EMBR_WIKI_DIR AND DEFINED ENV{EMBR_WIKI_DIR})
+    set(EMBR_WIKI_DIR "$ENV{EMBR_WIKI_DIR}")
+endif()
+if(NOT EMBR_WIKI_DIR AND EXISTS "${CMAKE_SOURCE_DIR}/wiki/home.md")
+    set(EMBR_WIKI_DIR "${CMAKE_SOURCE_DIR}/wiki")
+endif()
+set(EMBR_WIKI_DIR "${EMBR_WIKI_DIR}" CACHE PATH "the wiki clone the docs checks in CTest read (default: the wiki/ submodule)")
+if(EMBR_WIKI_DIR AND NOT IS_DIRECTORY "${EMBR_WIKI_DIR}")
+    message(WARNING "EMBR_WIKI_DIR=${EMBR_WIKI_DIR} is not a folder, the wiki docs checks will be skipped")
+    set(EMBR_WIKI_DIR "")
+endif()
+
+# unit tests run through CTest
 include(CTest)
 
-# which execution backend(s) end up compiled into embr.h -- and therefore
-# into every target that links embr_single_header (embr itself, every
-# plugin, every test_* binary) -- is chosen here, not in the source tree.
-# see include/embr/backends/tree_walker.h and backends/vm.h: both are always
-# #include'd by core/root.h, but each one's *content* is a no-op unless its
-# own EMBR_WITH_* macro is defined, which happens via the DEFINES passed to
-# embr_amalgamate() below (baked in as #defines at the top of the generated
-# header). at least one must be on.
+# which execution backend(s) end up compiled into embr.h
 option(EMBR_WITH_TREE_WALKER "Compile in the AST tree-walking backend" ON)
 option(EMBR_WITH_VM          "Compile in the bytecode VM backend"      OFF)
 
@@ -47,9 +53,8 @@ if(EMBR_WITH_VM)
 endif()
 list(JOIN EMBR_BACKEND_NAMES " + " EMBR_BACKEND_NAMES_STR)
 
-# embr.h is generated at build time from the modular sources under include/embr/{core,backends}/
-# edit the modular headers
-# every target below depends on the regenerated header and rebuilds it automatically.
+# embr.h is generated at build time
+# every target below depends on the regenerated header and rebuilds it automatically
 include(cmake/amalgamate.cmake)
 
 embr_amalgamate(embr_single_header
@@ -90,14 +95,53 @@ if(WIN32)
                 "$<TARGET_FILE_DIR:embr>"
         )
     endforeach()
+elseif(APPLE)
+    set(BIN_DIR ${CMAKE_SOURCE_DIR}/bin/macos)
 else()
     set(BIN_DIR ${CMAKE_SOURCE_DIR}/bin/linux)
 endif()
 
 set_target_properties(embr PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${BIN_DIR}")
 
+# which build directory produced this binary
+get_filename_component(EMBR_BUILD_NAME "${CMAKE_BINARY_DIR}" NAME)
+target_compile_definitions(embr PRIVATE EMBR_BUILD_NAME="${EMBR_BUILD_NAME}" EMBR_VERSION="${PROJECT_VERSION}")
+
+# a stamp next to the binary saying which build directory wrote it last
+add_custom_command(TARGET embr POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -DNAME=${EMBR_BUILD_NAME} -DOUT=${BIN_DIR}/.built-by -P ${CMAKE_SOURCE_DIR}/cmake/write_stamp.cmake
+    VERBATIM
+)
+
 add_subdirectory(plugins)
+add_subdirectory(modules)
+add_subdirectory(examples)
 
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
+
+# cmake --install <build dir> --prefix <dir>
+# gives prefix/bin/embr, prefix/lib/embr/{plugins,modules}, prefix/include/embr/embr.h and prefix/share/doc/embr
+# the plugins and modules are installed by their own CMakeLists
+# the embr binary finds prefix/lib/embr by itself
+install(TARGETS embr RUNTIME DESTINATION bin)
+install(FILES "${CMAKE_BINARY_DIR}/generated/embr/embr.h" DESTINATION include/embr)
+install(FILES README.md LICENSE DESTINATION share/doc/embr)
+
+# cmake --build <build dir> --target package     makes embr-<version>-<os>-<arch>.tar.gz
+string(TOLOWER "${CMAKE_SYSTEM_NAME}" EMBR_PACKAGE_OS)
+set(CPACK_PACKAGE_NAME embr)
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+# a toolchain file that sets CMAKE_SYSTEM_NAME leaves CMAKE_SYSTEM_PROCESSOR empty, so fall back to the host's
+set(EMBR_PACKAGE_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if(NOT EMBR_PACKAGE_ARCH)
+    set(EMBR_PACKAGE_ARCH "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+endif()
+string(TOLOWER "${EMBR_PACKAGE_ARCH}" EMBR_PACKAGE_ARCH)
+set(CPACK_PACKAGE_FILE_NAME "embr-${PROJECT_VERSION}-${EMBR_PACKAGE_OS}-${EMBR_PACKAGE_ARCH}")
+set(CPACK_GENERATOR TGZ)
+if(WIN32)
+    set(CPACK_GENERATOR ZIP)
+endif()
+include(CPack)

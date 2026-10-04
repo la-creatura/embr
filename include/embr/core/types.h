@@ -89,10 +89,14 @@ struct Param {
     TypeSet     type     = TS::Any;
     bool        optional = false;
     bool        variadic = false;
+    // a native parameter the function changes where the caller keeps it. the call site must pass `&name`
+    // (see "in-out parameters" on the wiki architecture page). only natives can have one
+    bool        inout    = false;
 
     static Param req (std::string nm, TypeSet t = TypeSet::Any()) { return {std::move(nm), t, false, false}; }
     static Param opt (std::string nm, TypeSet t = TypeSet::Any()) { return {std::move(nm), t, true,  false}; }
     static Param rest(std::string nm, TypeSet t = TypeSet::Any()) { return {std::move(nm), t, true,  true }; }
+    static Param io  (std::string nm, TypeSet t = TypeSet::Any()) { return {std::move(nm), t, false, false, true}; }
 };
 
 } // namespace embr

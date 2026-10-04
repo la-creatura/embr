@@ -1,0 +1,37 @@
+# requires: posix
+# files, paths and the process environment (everything happens in a scratch directory)
+import "fs"
+import "path"
+import "os"
+import "embrlib"
+
+base = path_join(os_cwd(), "example_scratch")
+fs_mkdir(path_join(base, "sub"), 1)
+
+file = path_join(base, "sub", "notes.txt")
+write_file(file, "first line\n")
+append_file(file, "second line\n")
+print(load_file(file))
+
+print(path_basename(file))
+print(path_extname(file))
+print(path_stem(file))
+print(path_basename(path_dirname(file)))
+print(path_normalize("a/./b/../c"))
+print(path_is_abs(file))
+print(fs_list_dir(path_join(base, "sub")))
+
+# environment variables and running a program (no shell involved)
+os_setenv("EMBR_EXAMPLE", "works")
+print(os_getenv("EMBR_EXAMPLE"))
+print(os_getenv("EMBR_DEFINITELY_UNSET", "default"))
+r = os_exec(["sh", "-c", "echo $EMBR_EXAMPLE; exit 3"])
+print(r["code"])
+print(r["stdout"])
+print(os_exec(["cat"], "piped in")["stdout"])
+print(os_platform() != "unknown")
+
+fs_remove(file)
+fs_remove(path_join(base, "sub"))
+fs_remove(base)
+print(fs_exists(base))

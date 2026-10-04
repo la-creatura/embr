@@ -1,0 +1,8 @@
+# tight numeric loop: dispatch cost of arithmetic, compare, assign, jump
+total = 0
+i = 0
+while i < 3000000
+    total = total + i % 7
+    i = i + 1
+end
+print(total)

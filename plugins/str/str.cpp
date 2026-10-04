@@ -1,17 +1,32 @@
+// str.cpp
+// core string plugin for embr: split/replace/strip/case/find/pad/etc.
+//
+// usage
+//   import "str"
+//   print(str_upper("hi"))                                    # HI
+//   print(str_split("a,b,c", ","))                            # ["a", "b", "c"]
+//   print(str_format("{} scored {:.1f}%", "ada", 97.456))     # ada scored 97.5%
+//
+// encoding: byte-oriented by design, not Unicode-aware. embr strings are plain bytes, and this plugin works on them
+// directly: str_ord/str_chr use one byte (0-255), str_isalpha/isdigit/isalnum use the C locale's ::isalpha family
+// (ASCII only unless the process locale says otherwise), and str_split/str_reverse/etc. cut by byte offset, which
+// can split a multi-byte UTF-8 character in half. that keeps str_* fast and dependency-free, and is what most
+// callers want (ASCII identifiers, delimiters, protocol bytes). for real codepoint semantics, `import "unicode"`
+
 #include <embr/embr.h>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 using namespace embr;
 
-//static Param pAny(std::string n)                      { return Param::req(std::move(n), TS::Any); }
 static Param pStr(std::string n)                      { return Param::req(std::move(n), TS::Str); }
-//static Param pArr(std::string n)                      { return Param::req(std::move(n), TS::Arr); }
-//static Param pMap(std::string n)                      { return Param::req(std::move(n), TS::Map); }
 static Param pNum(std::string n)                      { return Param::req(std::move(n), TS::Num); }
 static Param pOpt(std::string n, TypeSet m = TS::Any) { return Param::opt(std::move(n), m);       }
 
-static void throwError(const std::string& fn, const std::string& msg) {
+[[noreturn]] static void throwError(const std::string& fn, const std::string& msg) {
     raiseError("[str:" + fn + "]", msg);
 }
 
@@ -70,7 +85,10 @@ Value str_upper(const std::vector<Value>& args) {
 
 Value str_find(const std::vector<Value>& args) {
     size_t startPos = 0;
-    if (args.size() >= 3) startPos = (size_t)args[2].asNumber();
+    if (args.size() >= 3) {
+        int64_t p = numToInt64(args[2], "str_find", "start");
+        startPos = p < 0 ? 0 : (size_t)p;
+    }
     size_t pos = args[0].asString().find(args[1].asString(), startPos);
     return Value(pos == std::string::npos ? -1.0 : (double)pos);
 }
@@ -119,18 +137,21 @@ Value str_ord(const std::vector<Value>& args) {
 
 Value str_chr(const std::vector<Value>& args) {
     if (!args[0].isNumeric()) throwError("chr", "argument must be a number");
-    int code = (int)args[0].asNumber();
+    int64_t code = numToInt64(args[0], "chr", "argument");
     if (code < 0 || code > 255) throwError("chr", "code point out of range (0-255)");
     return Value(std::string(1, (char)code));
 }
 
 Value str_repeat(const std::vector<Value>& args) {
     const std::string& s = args[0].asString();
-    int n = (int)args[1].asNumber();
+    int64_t n = numToInt64(args[1], "str_repeat", "count");
     if (n < 0) throwError("str_repeat", "count must not be negative");
+    if (!s.empty() && n > kMaxScriptAlloc / (int64_t)s.size())
+        throwError("str_repeat", "result would exceed the limit of " + std::to_string(kMaxScriptAlloc) + " bytes");
+    if (s.empty()) return Value(std::string());   // nothing to repeat, and n can be huge
     std::string out;
     out.reserve(s.size() * (size_t)n);
-    for (int i = 0; i < n; ++i) out += s;
+    for (int64_t i = 0; i < n; ++i) out += s;
     return Value(std::move(out));
 }
 
@@ -142,19 +163,21 @@ Value str_reverse(const std::vector<Value>& args) {
 
 Value str_pad_left(const std::vector<Value>& args) {
     std::string s = args[0].asString();
-    int width = (int)args[1].asNumber();
+    int64_t width = numToInt64(args[1], "str_pad_left", "width");
     std::string ch = args.size() >= 3 ? args[2].asString() : " ";
     if (ch.size() != 1) throwError("str_pad_left", "pad char must be a single character");
-    if ((int)s.size() >= width) return Value(std::move(s));
+    if ((int64_t)s.size() >= width) return Value(std::move(s));
+    checkAllocSize("str_pad_left", "width", width);
     return Value(std::string((size_t)width - s.size(), ch[0]) + s);
 }
 
 Value str_pad_right(const std::vector<Value>& args) {
     std::string s = args[0].asString();
-    int width = (int)args[1].asNumber();
+    int64_t width = numToInt64(args[1], "str_pad_right", "width");
     std::string ch = args.size() >= 3 ? args[2].asString() : " ";
     if (ch.size() != 1) throwError("str_pad_right", "pad char must be a single character");
-    if ((int)s.size() >= width) return Value(std::move(s));
+    if ((int64_t)s.size() >= width) return Value(std::move(s));
+    checkAllocSize("str_pad_right", "width", width);
     return Value(s + std::string((size_t)width - s.size(), ch[0]));
 }
 
@@ -172,6 +195,176 @@ Value str_rtrim(const std::vector<Value>& args) {
     size_t end = s.find_last_not_of(chars);
     if (end == std::string::npos) return Value(std::string(""));
     return Value(s.substr(0, end + 1));
+}
+
+// ---- str_format ---------------------------------------------------------------------------------
+// str_format(template: str, ...args) -> str
+//
+//   str_format("{} scored {:.1f}%", "ada", 97.456)     -> "ada scored 97.5%"
+//   str_format("[{:>6}] [{:<6}] [{:^6}]", "a", "b", "c") -> "[     a] [b     ] [  c   ]"
+//   str_format("{:08.3f} {:+d} {:#x}", 3.14159, 5, 255) -> "0003.142 +5 0xff"
+//   str_format("{1}-{0} {{literal}}", "a", "b")          -> "b-a {literal}"
+//
+// placeholder: `{}` (next argument), `{N}` (argument N, 0-based), optionally followed by `:SPEC`
+// SPEC = [[fill]align][sign][#][0][width][.precision][type]
+//   align     < left, > right, ^ centre (default: numbers right, everything else left); fill is any one
+//             byte before the align character (default space)
+//   sign      + always show a sign, - only for negatives (default), ' ' a space for non-negatives
+//   #         0x / 0o / 0b prefix for x X o b
+//   0         pad numbers with zeros after the sign (same as fill 0 with align =... but simpler)
+//   width     minimum width in bytes (a multi-byte UTF-8 character counts as several)
+//   precision digits after the point for f/e/g; maximum bytes for strings
+//   type      d x X o b: an integer (an integral float is accepted); f e g: a float; s: any value as text;
+//             omitted: natural form (numbers as print() shows them, strings as-is, arrays/maps as print())
+// `{{` and `}}` are literal braces. numbering is either all automatic or all explicit, never mixed.
+// fewer arguments than placeholders raises; extra arguments are ignored. decimal points are always '.'.
+
+namespace fmt {
+
+struct Spec {
+    char fill = ' '; char align = 0; char sign = '-'; bool alt = false; bool zero = false;
+    int  width = 0;  int  prec = -1; char type = 0;
+};
+
+[[noreturn]] void bad(const std::string& why) { throwError("str_format", why); }
+
+Spec parseSpec(const std::string& sp) {
+    Spec r;
+    size_t i = 0, n = sp.size();
+    auto isAlign = [](char c) { return c == '<' || c == '>' || c == '^'; };
+    if (n >= 2 && isAlign(sp[1])) { r.fill = sp[0]; r.align = sp[1]; i = 2; }
+    else if (n >= 1 && isAlign(sp[0])) { r.align = sp[0]; i = 1; }
+    if (i < n && (sp[i] == '+' || sp[i] == '-' || sp[i] == ' ')) r.sign = sp[i++];
+    if (i < n && sp[i] == '#') { r.alt = true; ++i; }
+    if (i < n && sp[i] == '0') { r.zero = true; ++i; }
+    auto number = [&](int& out) {
+        if (i >= n || sp[i] < '0' || sp[i] > '9') return false;
+        long v = 0;
+        while (i < n && sp[i] >= '0' && sp[i] <= '9') { v = v * 10 + (sp[i++] - '0'); if (v > 100000) bad("width/precision too large (max 100000)"); }
+        out = (int)v; return true;
+    };
+    number(r.width);
+    if (i < n && sp[i] == '.') { ++i; if (!number(r.prec)) bad("missing precision after '.'"); }
+    if (i < n) r.type = sp[i++];
+    if (i < n) bad("invalid format spec \"" + sp + "\"");
+    if (r.type && !std::strchr("dxXobfegs", r.type)) bad(std::string("unknown format type '") + r.type + "'");
+    return r;
+}
+
+std::string pad(std::string body, const Spec& sp, char defaultAlign) {
+    if ((int)body.size() >= sp.width) return body;
+    size_t fillN = (size_t)sp.width - body.size();
+    char al = sp.align ? sp.align : defaultAlign;
+    if (al == '<') return body + std::string(fillN, sp.fill);
+    if (al == '>') return std::string(fillN, sp.fill) + body;
+    size_t left = fillN / 2;                                  // centre: the odd extra byte goes right
+    return std::string(left, sp.fill) + body + std::string(fillN - left, sp.fill);
+}
+
+// sign + (prefix) + digits, with zero padding placed after the sign/prefix
+std::string finishNumber(bool neg, std::string prefix, std::string digits, const Spec& sp) {
+    std::string signStr = neg ? "-" : (sp.sign == '+' ? "+" : (sp.sign == ' ' ? " " : ""));
+    if (sp.zero && !sp.align && (int)(signStr.size() + prefix.size() + digits.size()) < sp.width)
+        digits = std::string((size_t)sp.width - signStr.size() - prefix.size() - digits.size(), '0') + digits;
+    return pad(signStr + prefix + digits, sp, '>');
+}
+
+std::string fmtInt(const Value& v, const Spec& sp) {
+    int64_t x;
+    if (v.isInt()) x = v.asInt();
+    else if (v.isNumber() && std::floor(v.asNumber()) == v.asNumber() && std::fabs(v.asNumber()) < 9.2e18) x = (int64_t)v.asNumber();
+    else bad(std::string("'") + sp.type + "' needs an integer, got " + v.formatAsString());
+    bool neg = x < 0;
+    uint64_t m = neg ? (uint64_t)0 - (uint64_t)x : (uint64_t)x;
+    int base = sp.type == 'x' || sp.type == 'X' ? 16 : sp.type == 'o' ? 8 : sp.type == 'b' ? 2 : 10;
+    std::string digits;
+    const char* dg = sp.type == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
+    do { digits += dg[m % (uint64_t)base]; m /= (uint64_t)base; } while (m);
+    std::reverse(digits.begin(), digits.end());
+    std::string prefix;
+    if (sp.alt) prefix = base == 16 ? (sp.type == 'X' ? "0X" : "0x") : base == 8 ? "0o" : base == 2 ? "0b" : "";
+    return finishNumber(neg, prefix, digits, sp);
+}
+
+std::string fmtFloat(const Value& v, const Spec& sp) {
+    if (!v.isNumeric()) bad(std::string("'") + sp.type + "' needs a number, got " + v.typeName());
+    double d = v.asNumber();
+    if (std::isnan(d) || std::isinf(d)) return pad(std::isnan(d) ? "nan" : (d < 0 ? "-inf" : "inf"), sp, '>');
+    bool neg = std::signbit(d);
+    char form[8];
+    std::snprintf(form, sizeof form, "%%.*%c", sp.type);
+    int prec = sp.prec >= 0 ? sp.prec : 6;
+    std::string buf(512 + (size_t)prec, '\0');
+    int n = std::snprintf(buf.data(), buf.size(), form, prec, std::fabs(d));
+    if (n < 0) bad("formatting failed");
+    if ((size_t)n >= buf.size()) { buf.assign((size_t)n + 1, '\0'); std::snprintf(buf.data(), buf.size(), form, prec, std::fabs(d)); }
+    buf.resize((size_t)n);
+    return finishNumber(neg, "", buf, sp);
+}
+
+std::string formatOne(const Value& v, const Spec& sp) {
+    switch (sp.type) {
+        case 'd': case 'x': case 'X': case 'o': case 'b': return fmtInt(v, sp);
+        case 'f': case 'e': case 'g': return fmtFloat(v, sp);
+        default: break;
+    }
+    if (sp.type == 0 && v.isNumeric()) {                      // natural number form, honouring sign/width
+        if (sp.prec >= 0) { Spec g = sp; g.type = 'g'; return fmtFloat(v, g); }
+        std::string txt = v.formatAsString();
+        bool neg = !txt.empty() && txt[0] == '-';
+        return finishNumber(neg, "", neg ? txt.substr(1) : txt, sp);
+    }
+    std::string txt = v.isString() ? v.asString() : v.formatAsString();
+    if (sp.prec >= 0 && (int)txt.size() > sp.prec) txt.resize((size_t)sp.prec);
+    return pad(txt, sp, '<');
+}
+
+} // namespace fmt
+
+Value str_format(const std::vector<Value>& args) {
+    const std::string& t = args[0].asString();
+    size_t nargs = args.size() - 1, nextAuto = 0;
+    int mode = 0;                                             // 0 undecided, 1 automatic, 2 explicit
+    std::string out;
+    for (size_t i = 0; i < t.size(); ++i) {
+        char c = t[i];
+        if (c == '}') {
+            if (i + 1 < t.size() && t[i + 1] == '}') { out += '}'; ++i; continue; }
+            fmt::bad("single '}' in template (write '}}' for a literal brace)");
+        }
+        if (c != '{') { out += c; continue; }
+        if (i + 1 < t.size() && t[i + 1] == '{') { out += '{'; ++i; continue; }
+        size_t close = t.find('}', i + 1);
+        if (close == std::string::npos) fmt::bad("unterminated '{' in template");
+        std::string field = t.substr(i + 1, close - i - 1), specText;
+        size_t colon = field.find(':');
+        if (colon != std::string::npos) { specText = field.substr(colon + 1); field.resize(colon); }
+        size_t idx;
+        if (field.empty()) {
+            if (mode == 2) fmt::bad("cannot mix automatic {} and numbered {N} placeholders");
+            mode = 1; idx = nextAuto++;
+        } else {
+            for (char d : field) if (d < '0' || d > '9') fmt::bad("invalid placeholder '{" + field + "}'");
+            if (mode == 1) fmt::bad("cannot mix automatic {} and numbered {N} placeholders");
+            mode = 2;
+            if (field.size() > 6) fmt::bad("placeholder index too large");
+            idx = (size_t)std::stoul(field);
+        }
+        if (idx >= nargs)
+            fmt::bad("template needs argument " + std::to_string(idx) + " but only " + std::to_string(nargs) + " were given");
+        out += fmt::formatOne(args[idx + 1], fmt::parseSpec(specText));
+        if (out.size() > (size_t)kMaxScriptAlloc) fmt::bad("result too large");
+        i = close;
+    }
+    return Value(std::move(out));
+}
+
+// num_fixed(x: num, digits: num) -> str    (num_fixed(3.14159, 2) -> "3.14"; digits 0..100)
+Value num_fixed(const std::vector<Value>& args) {
+    int64_t d = numToInt64(args[1], "num_fixed", "digits");
+    if (d < 0 || d > 100) throwError("num_fixed", "digits must be between 0 and 100");
+    fmt::Spec sp; sp.type = 'f'; sp.prec = (int)d;
+    return Value(fmt::fmtFloat(args[0], sp));
 }
 
 EMBR_PLUGIN {
@@ -193,6 +386,8 @@ EMBR_PLUGIN {
     interp->bindSig("str_reverse",    {pStr("string")}, str_reverse);
     interp->bindSig("str_pad_left",   {pStr("string"), pNum("width"), pOpt("pad_char", TS::Str)}, str_pad_left);
     interp->bindSig("str_pad_right",  {pStr("string"), pNum("width"), pOpt("pad_char", TS::Str)}, str_pad_right);
+    interp->bindSig("str_format",     {pStr("template"), Param::rest("args", TS::Any)}, str_format);
+    interp->bindSig("num_fixed",      {pNum("x"), pNum("digits")}, num_fixed);
     interp->bindSig("str_ltrim",      {pStr("string")}, str_ltrim);
     interp->bindSig("str_rtrim",      {pStr("string")}, str_rtrim);
 }

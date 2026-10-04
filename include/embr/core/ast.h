@@ -5,17 +5,24 @@
 #include "types.h"
 #include "fwd.h"
 
+#include <cstdint>
 #include <vector>
 #include <memory>
 #include <utility>
 #include <string>
+#include <unordered_set>
 
 namespace embr {
 
 struct Expr {
-    enum class Kind { Number, Int, String, Var, Unary, Binary, Call, Array, Map, Index, Lambda, And, Or };
+    enum class Kind { Number, Int, String, Var, Unary, Binary, Call, Array, Map, Index, Lambda, And, Or, Ref };
     Kind        kind;
     SourceRange range;
+    // height of the expression tree rooted here (a leaf is 1). set by the parser on every compound
+    // node and capped (Parser::kMaxExprDepth) so the recursive evaluators, the VM compiler, and the
+    // nodes' own destructors can't be driven into a native stack overflow by a very long operator
+    // chain or deeply nested input
+    int         depth = 1;
     explicit Expr(Kind k) : kind(k) {}
     virtual ~Expr() = default;
 };
@@ -33,7 +40,17 @@ struct LogicExpr  : Expr { ExprPtr left, right;                           LogicE
 struct CallExpr   : Expr { ExprPtr callee;      std::vector<ExprPtr> args; CallExpr():Expr(Kind::Call)  {} };
 struct ArrayExpr  : Expr { std::vector<ExprPtr> elements;                 ArrayExpr():Expr(Kind::Array) {} };
 struct MapExpr    : Expr { std::vector<std::pair<ExprPtr,ExprPtr>> entries; MapExpr():Expr(Kind::Map)   {} };
-struct IndexExpr  : Expr { ExprPtr object,index;                          IndexExpr():Expr(Kind::Index) {} };
+struct IndexExpr  : Expr {
+    ExprPtr object,index;
+    // the tree-walker's answer to "can the key run script code", worked out the first time it is needed:
+    // -1 not yet, otherwise a Purity, plus the pure builtins the key calls (see purityOf)
+    mutable int8_t                   keyPurity = -1;
+    mutable std::vector<std::string> keyCallees;
+    IndexExpr():Expr(Kind::Index) {}
+};
+// `&target` in a call argument: a variable, or an element of one (`&a`, `&a[i]`, `&a[i]["k"]`). only the parser
+// makes one, and only as a direct call argument. the callee must be a native with an in-out parameter there
+struct RefExpr    : Expr { ExprPtr target;                                RefExpr():Expr(Kind::Ref) {} };
 
 // body heap-owned unlike FnStmt owned by program vector
 struct LambdaExpr : Expr {
@@ -111,7 +128,67 @@ struct TryStmt : Stmt {
     std::vector<StmtPtr> catchBlock;
     TryStmt():Stmt(Kind::Try){}
 };
-struct ImportStmt : Stmt { std::string path; ImportStmt():Stmt(Kind::Import){} };
+// import <expr>
+// the path is an expression, not only a string literal, so a script can build it (`import "plugins/" + name`),
+// like load_module() already allows. each backend evaluates it at runtime and raises if it isn't a string
+struct ImportStmt : Stmt { ExprPtr pathExpr; ImportStmt():Stmt(Kind::Import){} };
+
+// how much script code an expression can run while it is worked out
+enum class Purity { CallFree, PureCalls, Impure };
+
+// builtins that only look at their arguments: no callbacks, no writes to variables. calling one doesn't count as
+// running script code, as long as the name still means the builtin (STASH_VAR checks that when it runs)
+inline bool isPureBuiltin(const std::string& n) {
+    static const std::unordered_set<std::string> names = {
+        "str", "num", "len", "type", "has", "keys", "values", "slice", "join", "min", "max", "sum", "index_of"};
+    return names.count(n) > 0;
+}
+
+// `callees` (if given) collects the names of the pure builtins the expression calls
+// (a variable holding a pointer with a user-defined `+` or `len` is the one way around this, and is not worth a copy per read)
+inline Purity purityOf(const Expr* e, std::vector<std::string>* callees = nullptr) {
+    auto worse = [](Purity a, Purity b) { return a > b ? a : b; };
+    switch (e->kind) {
+    case Expr::Kind::Number: case Expr::Kind::Int: case Expr::Kind::String: case Expr::Kind::Var:
+        return Purity::CallFree;
+    case Expr::Kind::Unary:
+        return purityOf(static_cast<const UnaryExpr*>(e)->right.get(), callees);
+    case Expr::Kind::Binary: {
+        auto* b = static_cast<const BinaryExpr*>(e);
+        return worse(purityOf(b->left.get(), callees), purityOf(b->right.get(), callees));
+    }
+    case Expr::Kind::And: case Expr::Kind::Or: {
+        auto* l = static_cast<const LogicExpr*>(e);
+        return worse(purityOf(l->left.get(), callees), purityOf(l->right.get(), callees));
+    }
+    case Expr::Kind::Index: {
+        auto* i = static_cast<const IndexExpr*>(e);
+        return worse(purityOf(i->object.get(), callees), purityOf(i->index.get(), callees));
+    }
+    case Expr::Kind::Array: {
+        Purity p = Purity::CallFree;
+        for (auto& el : static_cast<const ArrayExpr*>(e)->elements) p = worse(p, purityOf(el.get(), callees));
+        return p;
+    }
+    case Expr::Kind::Map: {
+        Purity p = Purity::CallFree;
+        for (auto& kv : static_cast<const MapExpr*>(e)->entries)
+            p = worse(p, worse(purityOf(kv.first.get(), callees), purityOf(kv.second.get(), callees)));
+        return p;
+    }
+    case Expr::Kind::Call: {
+        auto* c = static_cast<const CallExpr*>(e);
+        if (c->callee->kind != Expr::Kind::Var) return Purity::Impure;
+        const std::string& nm = static_cast<const VarExpr*>(c->callee.get())->name;
+        if (!isPureBuiltin(nm)) return Purity::Impure;
+        for (auto& a : c->args) if (purityOf(a.get(), callees) == Purity::Impure) return Purity::Impure;
+        if (callees) callees->push_back(nm);
+        return Purity::PureCalls;
+    }
+    default: return Purity::Impure;   // Lambda
+    }
+}
+
 
 } // namespace embr
 

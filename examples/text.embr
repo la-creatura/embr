@@ -1,0 +1,26 @@
+# strings: bytes (str), regular expressions (regex), and code points (unicode)
+import "str"
+import "regex"
+import "unicode"
+import "embrlib"
+
+s = "  Hello, World  "
+print(str_strip(s))
+print(str_upper(str_strip(s)))
+print(str_split("a,b,c", ","))
+print(str_replace("2024-01-05", "-", "/"))
+print(str_pad_left("7", 3, "0"))
+
+# regex: ECMAScript syntax
+print(re_test("bob@example.com", "^[a-z]+@[a-z]+\\.com$"))
+print(re_find_all("a1 b22 c333", "[0-9]+"))
+print(re_match("2024-01-05", "(\\d+)-(\\d+)-(\\d+)"))
+print(re_replace("hello world", "(\\w+) (\\w+)", "$2 $1"))
+
+# str_len counts bytes; unicode_len counts code points
+word = unicode_chr(233) + "t" + unicode_chr(233)
+print(len(word))
+print(unicode_len(word))
+print(unicode_chars(word))
+print(unicode_ord(unicode_chr(8364)))
+print(unicode_valid(word))

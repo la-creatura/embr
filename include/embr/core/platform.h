@@ -5,6 +5,7 @@
 //
 // pulled out on its own so headers that don't touch dynamic loading (lexer, parser, AST, Value) don't have to drag in <windows.h> or <dlfcn.h>
 
+#include <cstdlib>
 #include <string>
 
 #ifdef _WIN32
@@ -40,7 +41,9 @@ namespace embr {
    using PluginHandle = void*;
    inline PluginHandle pluginOpen (const char *p)                { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
    inline void        *pluginSym  (PluginHandle h, const char *s){ return dlsym(h, s); }
-   inline void         pluginClose(PluginHandle h)               { dlclose(h); }
+   // EMBR_NO_DLCLOSE=1 keeps plugins mapped for the whole process: leak checkers (LeakSanitizer, valgrind)
+   // can then symbolise allocations made inside a plugin instead of reporting "<unknown module>"
+   inline void         pluginClose(PluginHandle h)               { if (!std::getenv("EMBR_NO_DLCLOSE")) dlclose(h); }
    inline std::string  pluginError()                             { const char *e = dlerror(); return e ? e : "unknown error"; }
 #  if defined(__APPLE__)
    static constexpr const char *PLUGIN_EXT = ".dylib";

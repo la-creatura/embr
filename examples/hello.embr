@@ -1,0 +1,56 @@
+# the basics: values, functions, control flow, closures
+import "embrlib"
+
+name = "embr"
+print("hello from " + name)
+
+fn fib(n)
+    if n < 2
+        return n
+    end
+    return fib(n - 1) + fib(n - 2)
+end
+print(fib(15))
+
+# int and float are different core types; / always produces a float
+print(7 / 2)
+print(7 % 2)
+print(type(5))
+print(type(5.0))
+
+# closures capture variables (shared, by reference)
+fn make_counter()
+    n = 0
+    return fn()
+        n = n + 1
+        return n
+    end
+end
+c = make_counter()
+c()
+c()
+print(c())
+
+# loops
+total = 0
+for x in [1, 2, 3, 4]
+    total += x
+end
+print(total)
+
+i = 0
+while i < 10
+    i += 1
+    if i == 3
+        continue
+    end
+    if i > 5
+        break
+    end
+end
+print(i)
+
+# maps: literal keys, dot access is sugar for ["key"]
+person = {name: "Ada", langs: ["embr", "C++"]}
+print(person.name)
+print(person["langs"][1])

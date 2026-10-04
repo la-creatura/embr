@@ -1,0 +1,106 @@
+# testing.embr -- assertion helpers for `embr test` (and for plain scripts)
+#
+#   import "testing.embr"
+#
+#   fn test_addition()
+#       assert_eq(1 + 1, 2)
+#       assert_eq([1, 2], [1, 2], "arrays compare structurally")
+#   end
+#
+#   fn test_errors()
+#       e = assert_raises(fn() return 1 / 0 end)      # returns the caught error map
+#       assert_true(len(e["message"]) > 0)
+#       assert_raises_with(fn() error("disk full") end, "disk")
+#   end
+#
+# `embr test` runs every top-level function named test_*, in name order, each in its own try/catch so one failure
+# doesn't stop the rest. an optional `setup()` runs before each test and `teardown()` after it (also after a
+# failure). a failed assertion raises an ordinary error, so its message and call trace show up in the report. every
+# assert takes optional trailing message parts that are appended
+#
+# names starting with __testing_ are internal
+
+import "embrlib"
+import "str"
+
+fn __testing_show(v)
+    if type(v) == "string"
+        return "\"" + v + "\""
+    end
+    return str(v)
+end
+
+fn __testing_note(parts)
+    if len(parts) == 0
+        return ""
+    end
+    return " (" + join(for_each_do(parts, fn(p) return str(p) end), " ") + ")"
+end
+
+fn assert_true(cond, ...note)
+    if !cond
+        error("assert_true failed: got " + __testing_show(cond) + __testing_note(note))
+    end
+    return 0
+end
+
+fn assert_false(cond, ...note)
+    if cond
+        error("assert_false failed: got " + __testing_show(cond) + __testing_note(note))
+    end
+    return 0
+end
+
+fn assert_eq(actual, expected, ...note)
+    if actual != expected
+        error("assert_eq failed: expected " + __testing_show(expected) + ", got " + __testing_show(actual) + __testing_note(note))
+    end
+    return 0
+end
+
+fn assert_ne(actual, unexpected, ...note)
+    if actual == unexpected
+        error("assert_ne failed: both are " + __testing_show(actual) + __testing_note(note))
+    end
+    return 0
+end
+
+fn assert_near(actual, expected, eps, ...note)
+    local diff = actual - expected
+    if diff < 0
+        diff = 0 - diff
+    end
+    if diff > eps
+        error("assert_near failed: " + str(actual) + " is not within " + str(eps) + " of " + str(expected) + __testing_note(note))
+    end
+    return 0
+end
+
+# runs f() and returns the error it raised (the same map `catch` receives); fails if nothing was raised
+fn assert_raises(f, ...note)
+    local raised = 0
+    local err = {}
+    try
+        f()
+    catch e
+        raised = 1
+        err = e
+    end
+    if !raised
+        error("assert_raises failed: no error was raised" + __testing_note(note))
+    end
+    return err
+end
+
+# like assert_raises, and also requires the message to contain `text`
+fn assert_raises_with(f, text, ...note)
+    local err = assert_raises(f)
+    if str_find(err["message"], text) < 0
+        error("assert_raises_with failed: message " + __testing_show(err["message"]) + " does not contain " + __testing_show(text) + __testing_note(note))
+    end
+    return err
+end
+
+fn fail(msg)
+    error("fail: " + msg)
+end

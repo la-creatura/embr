@@ -27,6 +27,7 @@ inline parse_result parse_double(const char* first, const char* last, double& va
     auto res = std::from_chars(first, last, value);
     return {res.ptr, res.ec};
 #else
+    (void)last;  // strtod stops at the terminating NUL, so it doesn't need the end pointer
     char* end;
     value = std::strtod(first, &end);
     if (end == first) return {first, std::errc::invalid_argument};
@@ -91,16 +92,34 @@ struct SourceRange {
     }
 };
 
+// one script-function activation an error unwound through: the function's name and where it was called
+// from (file + line of the call expression in the caller). line 0 / empty file = called from native code
+// (a plugin's callback, e.g. a sort comparator) where there is no script call site.
+struct TraceFrame {
+    std::string fn;
+    std::string file;
+    int         line = 0;
+};
+
 struct EmbrError : std::runtime_error {
     bool        hasLocation;
     SourceRange range;
-    // unformatted message passed to raiseError() try ... catch e ... end binds e to
-    // since the fully formatted what() is meant for terminal display, not for a script to inspect/compare/re-report
+    // unformatted message passed to raiseError(), try ... catch e ... end
+    // binds e's "message" field to this, since the fully formatted what() is
+    // meant for terminal display, not for a script to inspect/compare/re-report
     std::string message;
+    // raiseError()'s first argument ("assert", "error", "runtime", "value", "parser", "vm", or a plugin's own
+    // tag like "ffi_call"). shown in what() and given to catch as its "kind", so a script can tell what raised
+    // an error without matching the message text
+    std::string context;
+    // call stack, innermost call first, filled in as the error unwinds out of script functions (the
+    // tree-walker's doInvoke and the VM's handleTry both append one frame per function they unwind
+    // through, so both backends produce the same list). script natives/builtins are not frames.
+    std::vector<TraceFrame> trace;
     explicit EmbrError(const std::string& formatted, bool loc = false, SourceRange r = {},
-                        std::string raw = {})
+                        std::string raw = {}, std::string ctx = {})
         : std::runtime_error(formatted), hasLocation(loc), range(r),
-          message(raw.empty() ? formatted : std::move(raw)) {}
+          message(raw.empty() ? formatted : std::move(raw)), context(std::move(ctx)) {}
 };
 
 [[noreturn]] inline void raiseError(
@@ -123,7 +142,7 @@ struct EmbrError : std::runtime_error {
                 << "\n";
         }
     }
-    throw EmbrError(out.str(), range.valid(), range, msg);
+    throw EmbrError(out.str(), range.valid(), range, msg, context);
 }
 
 [[noreturn]] inline void raiseError(const std::string& context, const std::string& msg,
@@ -132,7 +151,25 @@ struct EmbrError : std::runtime_error {
     out << "[" << context << "] " << msg;
     if (range.valid()) out << " at line " << range.startLine << ", col " << range.startCol;
     out << "\n";
-    throw EmbrError(out.str(), range.valid(), range, msg);
+    throw EmbrError(out.str(), range.valid(), range, msg, context);
+}
+
+// "stack trace (most recent call first):" block for an uncaught error, or "" when it has no frames
+inline std::string formatTrace(const EmbrError& e) {
+    if (e.trace.empty()) return "";
+    std::ostringstream out;
+    out << "stack trace (most recent call first):\n";
+    for (const auto& f : e.trace) {
+        out << "  in " << f.fn << "()";
+        if (f.line > 0) {
+            out << " called at line " << f.line;
+            if (!f.file.empty()) out << " of " << f.file;
+        } else {
+            out << " called from native code";
+        }
+        out << "\n";
+    }
+    return out.str();
 }
 
 } // namespace embr

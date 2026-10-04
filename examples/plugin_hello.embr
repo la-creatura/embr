@@ -1,0 +1,32 @@
+# uses the plugin built from examples/hello/hello.cpp -- see the writing-plugins wiki page
+import "hello"
+
+print(hello_greet("world"))
+print(hello_greet("embr", "Hi"))
+
+c = hello_counter()
+hello_counter_add(c, 5)
+hello_counter_add(c, 37)
+print(hello_counter_get(c))
+
+# the handle is opaque and unforgeable: a map pretending to be one is rejected
+try
+    hello_counter_get({"__type": "hello.counter"})
+catch e
+    print("rejected a forged handle")
+end
+
+# arity and types are checked for you by bindSig()
+try
+    hello_greet(5)
+catch e
+    print("rejected a non-string")
+end
+
+# calling back into script code from native code
+print(hello_map_sum([1, 2, 3], fn(x) return x * 10 end))
+try
+    hello_map_sum([1], fn(x) return "not a number" end)
+catch e
+    print(e["message"])
+end

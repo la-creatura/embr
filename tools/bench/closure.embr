@@ -1,0 +1,15 @@
+# closure creation + calls through captured upvalues
+fn make_counter()
+    n = 0
+    return fn()
+        n = n + 1
+        return n
+    end
+end
+c = make_counter()
+i = 0
+while i < 500000
+    c()
+    i = i + 1
+end
+print(c())

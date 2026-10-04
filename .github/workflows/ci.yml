@@ -1,0 +1,151 @@
+# ci for embr. every job is its own runner and checkout on purpose: bin/linux/ is shared by every cmake build
+# directory, so two presets must never build in the same checkout.
+#
+# every job builds with -Werror, the bar is a zero-warning build. the tests are the per-plugin CTest targets
+# (tests/CMakeLists.txt). on a dual-backend build each suite is registered twice (<name>_tw / <name>_vm).
+# every checkout pulls the wiki submodule (wiki/), so the docs checks (docs_examples, editor_grammar) run here too.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  # stop a wedged test (e.g. a deadlocked plugin) from hanging the whole job
+  CTEST_TIMEOUT: 120
+
+jobs:
+  linux-vm-debug:
+    name: linux-vm-debug (both backends)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
+      - name: configure
+        run: cmake --preset linux-vm-debug -DCMAKE_CXX_FLAGS=-Werror
+      - name: build
+        run: cmake --build build/linux-vm-debug -j"$(nproc)"
+      - name: test
+        run: ctest --test-dir build/linux-vm-debug -j"$(nproc)" --output-on-failure --timeout "$CTEST_TIMEOUT"
+
+  linux-release:
+    name: linux-release (tree-walker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
+      - name: configure
+        run: cmake --preset linux-release -DCMAKE_CXX_FLAGS=-Werror
+      - name: build
+        run: cmake --build build/linux-release -j"$(nproc)"
+      - name: test
+        run: ctest --test-dir build/linux-release -j"$(nproc)" --output-on-failure --timeout "$CTEST_TIMEOUT"
+
+  # both backends again, Debug, under AddressSanitizer + UndefinedBehaviorSanitizer.
+  # configured straight into a scratch dir instead of a preset, so it doesn't
+  # need a checked-in preset that writes to the shared bin/ directory.
+  sanitizers:
+    name: asan + ubsan (both backends)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
+      - name: configure
+        run: >
+          cmake -S . -B build/sanitize
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_TOOLCHAIN_FILE=cmake/linux-gcc.cmake
+          -DEMBR_WITH_TREE_WALKER=ON -DEMBR_WITH_VM=ON
+          -DCMAKE_CXX_FLAGS="-Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: build
+        run: cmake --build build/sanitize -j"$(nproc)"
+      - name: test
+        env:
+          # leak detection is ON: reference cycles (closure <-> scope, VM chunk siblings, self-containing
+          # tables) are broken at interpreter teardown, so a leak report is a real regression.
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build/sanitize -j"$(nproc)" --output-on-failure --timeout "$CTEST_TIMEOUT"
+
+  # a short fuzz run on every push. the seed is the run number, so a failure can be replayed with
+  # `SEED=<run number> tools/fuzz/run.sh <target>`; the saved inputs are uploaded when it fails.
+  # the fuzzers build in a scratch dir (tools/fuzz/run.sh), so they never touch bin/linux/.
+  fuzz-smoke:
+    name: fuzz smoke (frontend, fmt, json, plugins)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev
+      - name: configure and build (only the generated header is needed, but the build makes it)
+        run: |
+          cmake --preset linux-vm-debug
+          cmake --build build/linux-vm-debug -j"$(nproc)"
+      - name: fuzz
+        env:
+          OUT: ${{ runner.temp }}/embr-fuzz
+          SEED: ${{ github.run_number }}
+          N: 400
+        run: tools/fuzz/run.sh frontend fmt json plugins
+      - name: upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: ${{ runner.temp }}/embr-fuzz/*.*
+          if-no-files-found: ignore
+
+  # the VM must not get slower relative to the tree-walker. a ratio, not a time, so a noisy runner doesn't flake it:
+  # tools/bench/check.sh compares vm/tree-walker per benchmark with tools/bench/baseline.txt (35% tolerance,
+  # best of 5) and writes the table to the job summary. needs a Release build with both backends.
+  bench-guard:
+    name: bench guard (vm vs tree-walker ratio)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev libssl-dev bc
+      - name: configure and build
+        run: |
+          cmake --preset linux-vm-release
+          cmake --build build/linux-vm-release --target embr embrlib_plugin vec_plugin -j"$(nproc)"
+      - name: check ratios
+        run: tools/bench/check.sh
+
+  # macos has not been built by the maintainer yet (no mac available). this job exists so the first real run
+  # shows what is left to fix. continue-on-error keeps it from blocking merges until it has been green once,
+  # then delete that line. Homebrew's libffi and openssl@3 are keg-only, the cmake files look for them in both
+  # brew prefixes.
+  macos:
+    name: macos (experimental, not yet verified)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: install dependencies
+        run: brew install libffi pkg-config openssl@3
+      - name: configure
+        run: cmake --preset macos-vm-debug -DCMAKE_CXX_FLAGS=-Werror
+      - name: build
+        # -k keeps going after an error, so one run lists every compile problem instead of the first few
+        run: cmake --build build/macos-vm-debug -j"$(sysctl -n hw.ncpu)" -- -k
+      - name: test
+        run: ctest --test-dir build/macos-vm-debug -j"$(sysctl -n hw.ncpu)" --output-on-failure --timeout "$CTEST_TIMEOUT"

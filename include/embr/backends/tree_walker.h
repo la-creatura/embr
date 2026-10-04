@@ -35,10 +35,23 @@ class Runner {
 public:
     explicit Runner(Interpreter& interpreter) : interp(interpreter) {}
 
+    // definition files of the script functions currently executing, innermost last (see doInvoke)
+    std::vector<const std::string*> fileStack_;
+
+    // runs every top-level statement in order. an uncaught EmbrError stops the rest and goes to the caller,
+    // there is no per-statement recovery (same as the VM). a script that wants to keep going after an
+    // expected failure says so with `try ... catch e ... end`
+    //
+    // a `return` at top level (outside any fn) ends the script quietly, like on the VM. without a handler
+    // the internal ReturnSignal would reach std::terminate and kill the process
     void run(const std::vector<StmtPtr>& prog) {
-        for (auto& s : prog) {
-            try { exec(s.get()); }
-            catch (const EmbrError& e) { std::cerr << e.what(); }
+        try {
+            for (auto& s : prog) exec(s.get());
+        } catch (ReturnSignal&) {
+        } catch (BreakSignal&) {       // the parser rejects these outside a loop; never let one reach std::terminate
+            raiseError("runtime", "'break' outside a loop");
+        } catch (ContinueSignal&) {
+            raiseError("runtime", "'continue' outside a loop");
         }
     }
     void run(const std::vector<StmtPtr>& prog, const SourceMap& src,
@@ -51,11 +64,6 @@ public:
     Value invoke(const Value& callee, const std::vector<Value>& args,
                  const SourceRange& site = {}) {
         return doInvoke(callee, args, site);
-    }
-
-    // public entry point for load_module in embrlib
-    void importEmbrModule(const std::string& path, const SourceRange& site) {
-        execImportEmbrModule(path, site);
     }
 
     Interpreter& interp;
@@ -116,7 +124,7 @@ private:
     std::string suggest(const std::string& name) const {
         std::string best; size_t bestDist = 3;
         for (auto& sc : interp.allScopes()) {
-            for (auto& [k, _] : sc) {
+            for (auto& [k, _] : *sc) {
                 size_t d = editDistance(name, k, bestDist);
                 if (d < bestDist) { bestDist = d; best = k; }
             }
@@ -135,8 +143,20 @@ private:
 
     Value doInvoke(const Value& callee, const std::vector<Value>& args,
                    const SourceRange& site) {
-        if (!callee.isCallable())
+        if (!callee.isCallable()) {
+            // dunder fallback: a typed pointer that isn't callable (a table handle, an ffi handle, ...) can still be
+            // "called" if its tag has a __tag_call global (see resolveDunder() in core/registry.h). it is called as
+            // __tag_call(pointer, ...originalArgs)
+            Value dfn;
+            if (resolveDunder(interp, callee, "call", dfn)) {
+                std::vector<Value> dargs;
+                dargs.reserve(args.size() + 1);
+                dargs.push_back(callee);
+                dargs.insert(dargs.end(), args.begin(), args.end());
+                return doInvoke(dfn, dargs, site);
+            }
             error("value is not callable (got " + callee.typeName() + ")", site);
+        }
         Interpreter::CallDepthGuard depthGuard(interp, site);
         const auto& c = callee.asCallable();
 
@@ -148,13 +168,21 @@ private:
                 return c.native(args);
             } catch (EmbrError& e) {
                 if (!e.hasLocation && site.valid()) {
-                    // re-raise with call site location attached with raw message
-                    raiseError(c.name(), e.message, site, interp.sourceMap());
+                    // re-raise with call site location attached with raw message, carrying over the
+                    // trace frames already collected if this native called back into script code
+                    try { raiseError(c.name(), e.message, site, interp.sourceMap()); }
+                    catch (EmbrError& located) { located.trace = std::move(e.trace); throw; }
                 }
                 throw;
             }
         }
         const ScriptFn& fn = c.script;
+        // the file this call was made from: the body of whichever script function is running (its
+        // definition file), or the current top-level/module file when we're not inside one. kept as a
+        // stack of pointers so the cost on the hot path is a push/pop, not a string copy.
+        const std::string* callerFile = fileStack_.empty() ? &interp.currentFile() : fileStack_.back();
+        fileStack_.push_back(&fn.sourceFile);
+        struct FilePop { std::vector<const std::string*>& s; ~FilePop() { s.pop_back(); } } filePop{fileStack_};
         bool   hasVariadic = !fn.params.empty() && fn.params.back().variadic;
         size_t fixedCount  = hasVariadic ? fn.params.size() - 1 : fn.params.size();
 
@@ -178,20 +206,28 @@ private:
                           "'): expected " + vp.type.name() + " but got " + args[k].typeName(), site);
         }
 
-        // push capture frame first (outermost), then a fresh param scope on top
-        // params shadow captured names
-        // mutations to captured names inside the body update the body's capture scope (not the original frame)
+        // push every captured layer first (outermost to innermost, the same live Scope objects the closure
+        // closed over, see CaptureFrame in core/value.h), then a fresh param scope on top. params shadow
+        // captured names. changes to a captured name inside the body write into the shared layer, so other
+        // closures sharing it see them
         if (fn.captured) {
-            interp.pushCapture(fn.captured);  // capture layer
+            interp.pushCapture(fn.captured);  // every captured layer
             interp.push();                    // param layer
         } else {
             interp.push();                    // just a normal scope
         }
-        // use a manual guard that pops the right number of scopes
+        // use a manual guard that pops the right number of scopes: one per
+        // captured layer (if any), plus the param layer always pushed above.
         struct MultiPop {
-            Interpreter& i; int n;
+            Interpreter& i; size_t n;
             ~MultiPop() { while (n-- > 0) i.pop(); }
-        } guard{interp, fn.captured ? 2 : 1};
+        } guard{interp, (fn.captured ? fn.captured->layers.size() : 0) + 1};
+        // undeclared assignments inside this call create their variable in this call's scope (see
+        // Interpreter::assignFloor); restore the caller's floor however the call ends
+        struct FloorRestore {
+            Interpreter& i; size_t old;
+            ~FloorRestore() { i.swapFuncFloor(old); }
+        } floorRestore{interp, interp.swapFuncFloor(interp.topScopeIndex())};
 
         for (size_t k = 0; k < fixedCount; ++k)
             interp.define(fn.params[k].name, args[k]);
@@ -203,6 +239,13 @@ private:
 
         try { for (auto& s : *fn.body) exec(s.get()); }
         catch (ReturnSignal& ret) { result = std::move(ret.value); }
+        catch (EmbrError& e) {
+            // one trace frame per script function the error unwinds through (the VM's handleTry does the same, so both
+            // backends report the same call stack): the function's name, and where it was called from (the caller's file and
+            // this call's line, 0 if a native called back into script code, which has no script call site)
+            e.trace.push_back({fn.name, *callerFile, site.valid() ? site.startLine : 0});
+            throw;
+        }
         // enforce return type
         if (!fn.returnType.isAny() && !fn.returnType.contains(result.tag()))
             error("'" + fn.name + "' declared return type " +
@@ -244,10 +287,16 @@ private:
             if (!p)
                 for (auto it = sig.rbegin(); it != sig.rend(); ++it)
                     if (it->variadic) { p = &*it; break; }
+            const bool ref = isRef(args[i]);
+            if (p && p->inout != ref)
+                error(ref ? "argument '" + p->name + "' to '" + fname + "' is not an in-out parameter, so it can't take '&'"
+                          : "argument '" + p->name + "' to '" + fname + "' is changed in place, so pass it as &name", site);
+            if (!p && ref) error("'" + fname + "' can't take '&' for argument " + std::to_string(i + 1), site);
             if (!p || p->type.isAny()) continue;
-            if (!p->type.contains(args[i].tag()))
+            const Value& shown = ref ? refTarget(args[i]) : args[i];
+            if (!p->type.contains(shown.tag()))
                 error("argument '" + p->name + "' to '" + fname + "': expected " +
-                      p->type.name() + " but got " + args[i].typeName(), site);
+                      p->type.name() + " but got " + shown.typeName(), site);
         }
     }
 
@@ -257,6 +306,7 @@ private:
             if (i) s += ", ";
             const auto& p = sig[i];
             if (p.variadic) s += "...";
+            if (p.inout) s += "&";
             s += p.name;
             if (!p.type.isAny()) s += ": " + p.type.name();
             if (p.optional && !p.variadic) s += "?";
@@ -277,10 +327,18 @@ private:
             case Expr::Kind::Unary: {
                 auto* u = static_cast<UnaryExpr*>(e);
                 Value r = eval(u->right.get());
-                if (u->op == "-") return r.isInt() ? Value(-r.asInt()) : Value(-r.asNumber());
+                if (u->op == "-") {
+                    if (r.isNumeric()) return r.isInt() ? intNeg(r.asInt()) : Value(-r.asNumber());
+                    // dunder fallback: a typed pointer whose tag has a __tag_neg global (see resolveDunder() in core/registry.h)
+                    // "!" has no fallback: truthy() already gives every value an answer, unlike unary '-' which can fail in asNumber()
+                    Value dfn;
+                    if (resolveDunder(interp, r, "neg", dfn)) return doInvoke(dfn, {r}, u->range);
+                    error("unsupported operand for unary '-': " + r.typeName(), u->range);
+                }
                 if (u->op == "!") return Value(!r.truthy());
                 error("unknown unary op: " + u->op, u->range);
             }
+            case Expr::Kind::Ref: error("'&' only works on an argument of a call", e->range);
             case Expr::Kind::Binary: return evalBinary(static_cast<BinaryExpr*>(e));
             case Expr::Kind::Call:   return evalCall(static_cast<CallExpr*>(e));
             case Expr::Kind::Array: {
@@ -335,11 +393,11 @@ private:
             if (op=="+")  return Value(a+c);
         } else if (l.isInt() && r.isInt()) {
             int64_t a=l.asInt(), c=r.asInt();
-            if (op=="+")  return Value(a+c);
-            if (op=="-")  return Value(a-c);
-            if (op=="*")  return Value(a*c);
+            if (op=="+")  return intAdd(a, c);
+            if (op=="-")  return intSub(a, c);
+            if (op=="*")  return intMul(a, c);
             if (op=="/")  { if(c==0)   error("division by zero",b->range); return Value((double)a/(double)c); }
-            if (op=="%")  { if(c==0)   error("modulo by zero",b->range);   return Value(a%c); }
+            if (op=="%")  { if(c==0)   error("modulo by zero",b->range);   return intMod(a, c); }
             if (op==">")  return Value(a>c);
             if (op=="<")  return Value(a<c);
             if (op==">=") return Value(a>=c);
@@ -356,15 +414,46 @@ private:
             if (op==">=") return Value(a>=c);
             if (op=="<=") return Value(a<=c);
         }
-        if (!(l.isCallable()||r.isCallable())) {
-            if (op=="==") return Value(l==r);
-            if (op=="!=") return Value(l!=r);
+        // dunder fallback: if neither built-in path matched and an operand is a typed pointer whose tag has a
+        // __tag_<op> global (add/sub/mul/div/mod/gt/lt/gte/lte), call that instead of raising. left operand first,
+        // then right. "==" and "!=" are excluded on purpose (see arithDunderOp in core/registry.h)
+        if (const char* dop = arithDunderOp(op)) {
+            Value dfn;
+            if (resolveDunder(interp, l, dop, dfn) || resolveDunder(interp, r, dop, dfn))
+                return doInvoke(dfn, {l, r}, b->range);
         }
+        // == and != work on every value, callables included (identity; see Value::operator==)
+        if (op=="==") return Value(l==r);
+        if (op=="!=") return Value(l!=r);
         error("unsupported operator "+op+" between "+l.typeName()+" and "+r.typeName(), b->range);
     }
 
+    // can the key of this index run script code? a key with no calls can't. neither can one that only calls data-only
+    // builtins (str, len, ...), as long as each name still means a native function right now
+    bool keyIsCallFree(const IndexExpr* idx) {
+        if (idx->keyPurity < 0) idx->keyPurity = (int8_t)purityOf(idx->index.get(), &idx->keyCallees);
+        if (idx->keyPurity == (int8_t)Purity::CallFree) return true;
+        if (idx->keyPurity != (int8_t)Purity::PureCalls) return false;
+        for (const auto& n : idx->keyCallees) {
+            const Value* f = interp.find(n);
+            if (!f || !f->isCallable() || !f->asCallable().isNative()) return false;
+        }
+        return true;
+    }
+
     Value evalIndex(IndexExpr* idx) {
+        // `name[key]` reads the variable where it lives instead of copying all of it first. the key goes first, which
+        // only matters if it could change the variable, and a key with no calls can't
+        if (idx->object->kind == Expr::Kind::Var && keyIsCallFree(idx)) {
+            Value key = eval(idx->index.get());
+            if (const Value* c = interp.find(static_cast<VarExpr*>(idx->object.get())->name))
+                return indexValue(*c, key, idx);
+        }
         Value cont = eval(idx->object.get()), key = eval(idx->index.get());
+        return indexValue(cont, key, idx);
+    }
+
+    Value indexValue(const Value& cont, const Value& key, IndexExpr* idx) {
         if (cont.isString()) {
             int ii = (int)key.asNumber(); const auto& s = cont.asString();
             if (ii<0||ii>=(int)s.size()) error("string index "+std::to_string(ii)+" out of bounds. make sure the index is valid",idx->range);
@@ -372,9 +461,11 @@ private:
         }
         if (cont.isMap()) {
             if (!key.isString()) error("map key must be string. use str() if the index is an expression",idx->range);
-            const auto& m = cont.asMap(); auto it = m.find(key.asString());
-            if (it==m.end()) error("key not found: "+key.asString(),idx->range);
-            return it->second;
+            // own slot, then (if key isn't one) the map's own "__proto__"
+            // chain, see core/registry.h's lookupMapChain() doc comment.
+            Value found;
+            if (lookupMapChain(interp, cont, key.asString(), found)) return found;
+            error("key not found: "+key.asString(),idx->range);
         }
         if (cont.isArray()) {
             int ii=(int)key.asNumber(); const auto& a=cont.asArray();
@@ -390,10 +481,49 @@ private:
         std::vector<Value> args;
         args.reserve(call->args.size());
 
-        for (auto& a : call->args)
-            args.push_back(eval(a.get()));
+        bool hasRef = false;
+        for (auto& a : call->args) {
+            if (a->kind == Expr::Kind::Ref) { args.push_back(evalRefPath(static_cast<RefExpr*>(a.get()))); hasRef = true; }
+            else args.push_back(eval(a.get()));
+        }
 
+        if (hasRef) return callWithRefs(callee, args, call->range);
         return doInvoke(callee, args, call->range);
+    }
+
+    // `&name[k1][k2]` as an argument: works out the keys now, finds the variable later (see RefPath in core/value.h)
+    Value evalRefPath(RefExpr* r) {
+        std::vector<IndexExpr*> chain;
+        Expr* cur = r->target.get();
+        while (cur->kind == Expr::Kind::Index) { chain.push_back(static_cast<IndexExpr*>(cur)); cur = chain.back()->object.get(); }
+        RefPath p;
+        p.name = static_cast<VarExpr*>(cur)->name;
+        for (size_t i = chain.size(); i-- > 0; ) p.keys.push_back(eval(chain[i]->index.get()));
+        return makeRefPath(std::move(p));
+    }
+
+    // a call with at least one `&` argument: every argument is in, so the paths can be turned into references
+    Value callWithRefs(const Value& callee, std::vector<Value>& args, const SourceRange& site) {
+        if (!callee.isCallable() || !callee.asCallable().isNative() || callee.asCallable().sig.empty())
+            error("this call can't take '&': only natives with an in-out parameter do", site);
+        const auto& c = callee.asCallable();
+        for (auto& a : args) {
+            if (!isRefPath(a)) continue;
+            RefPath& p = refPathOf(a);
+            Value* root = interp.findMut(p.name);
+            if (!root) errorUndefined("variable", p.name, site);
+            std::shared_ptr<RefChain> chain;
+            std::string err;
+            Value* target = resolveRefPath(root, p, chain, err);
+            if (!target) error("&" + p.name + ": " + err, site);
+            a = makeRef(target, std::move(chain));
+        }
+        Value result;
+        try { result = doInvoke(callee, args, site); }
+        catch (...) { settleRefs(args); throw; }
+        settleRefs(args);
+        if (isRef(result)) error("'" + c.name() + "' returned a reference. natives must not hand one back", site);
+        return result;
     }
 
     // unpacks src into count Values for destructuring local/multi-assign
@@ -497,14 +627,17 @@ private:
                 } catch (const EmbrError& e) {
                     // BreakSignal/ContinueSignal/ReturnSignal aren't EmbrError
                     Interpreter::ScopeGuard guard(interp);
-                    interp.define(t->catchVar, Value(e.message));
+                    interp.define(t->catchVar, errorToMap(e));
                     for (auto& st : t->catchBlock) exec(st.get());
                 }
                 break;
             }
             case Stmt::Kind::Import: {
                 auto* im = static_cast<ImportStmt*>(s);
-                execImport(im->path, im->range);
+                Value pathVal = eval(im->pathExpr.get());
+                if (!pathVal.isString())
+                    error("import path must evaluate to a string, got " + pathVal.typeName(), im->range);
+                execImport(pathVal.asString(), im->range);
                 break;
             }
         }
@@ -554,15 +687,81 @@ private:
 
     void execAssign(AssignStmt* a) {
         if (a->target->kind == Expr::Kind::Var) {
-            interp.set(static_cast<VarExpr*>(a->target.get())->name,
-                        eval(a->value.get()));
+            auto* ve = static_cast<VarExpr*>(a->target.get());
+            if (a->value->kind == Expr::Kind::Call && appendInPlace(ve->name, static_cast<CallExpr*>(a->value.get()))) return;
+            interp.set(ve->name, eval(a->value.get()));
             return;
         }
         if (a->target->kind == Expr::Kind::Index) {
-            writeBack(a->target.get(), eval(a->value.get()), a->range);
+            Value v = eval(a->value.get());
+            if (assignInPlace(static_cast<IndexExpr*>(a->target.get()), v)) return;
+            writeBack(a->target.get(), std::move(v), a->range);
             return;
         }
         error("invalid assignment target", a->range);
+    }
+
+    // `x = push(x, v)` when push is embrlib's and x is an array: appends to x where it lives instead of building a
+    // whole new array. false means it didn't apply and nothing was evaluated that matters (v has no calls), so the
+    // ordinary assignment runs
+    bool appendInPlace(const std::string& name, CallExpr* c) {
+        if (c->callee->kind != Expr::Kind::Var || static_cast<VarExpr*>(c->callee.get())->name != "push" ||
+            c->args.size() != 2 || c->args[0]->kind != Expr::Kind::Var ||
+            static_cast<VarExpr*>(c->args[0].get())->name != name ||
+            purityOf(c->args[1].get()) != Purity::CallFree)
+            return false;
+        const Value* fn = interp.find("push");
+        Value* target = interp.findMut(name);
+        if (!fn || !fn->isCallable() || !fn->asCallable().isNative() || fn->asCallable().name() != "push" ||
+            !target || !target->isArray())
+            return false;
+        target->arrayAppend(eval(c->args[1].get()));
+        return true;
+    }
+
+    // `name[k1]..[kn] = v` changed where the variable lives, when no key can run script code. false means it didn't apply
+    // (a key with a call, an undefined name, an index that isn't there, a map key found only through __proto__), and
+    // nothing has changed, so writeBack() runs and reports whatever is wrong
+    bool assignInPlace(IndexExpr* idx, const Value& v) {
+        std::vector<IndexExpr*> chain;
+        Expr* cur = idx;
+        while (cur->kind == Expr::Kind::Index) {
+            auto* ix = static_cast<IndexExpr*>(cur);
+            if (!keyIsCallFree(ix)) return false;
+            chain.push_back(ix);
+            cur = ix->object.get();
+        }
+        if (cur->kind != Expr::Kind::Var) return false;
+        RefPath path;
+        path.name = static_cast<VarExpr*>(cur)->name;
+        for (size_t i = chain.size(); i-- > 1; ) path.keys.push_back(eval(chain[i]->index.get()));   // all but the last
+        Value last = eval(chain[0]->index.get());
+        Value* root = interp.findMut(path.name);
+        if (!root) return false;
+        std::shared_ptr<RefChain> rc;
+        std::string err;
+        Value* cont = resolveRefPath(root, path, rc, err);
+        if (!cont) return false;
+        size_t above = rc ? rc->above.size() : 0;
+        if (cont->isArray()) {
+            int ii = (int)last.asNumber();
+            if (ii < 0 || ii >= (int)cont->asArray().size()) return false;
+            Value::checkElementDepth(v, above);
+            cont->arraySet((size_t)ii, v);
+        } else if (cont->isMap()) {
+            if (!last.isString()) return false;
+            Value::checkElementDepth(v, above);
+            cont->mapSet(last.asString(), v);
+        } else if (cont->isString()) {
+            int ii = (int)last.asNumber();
+            if (!v.isString() || ii < 0 || ii >= (int)cont->asString().size()) return false;
+            cont->stringSetAt((size_t)ii, v.asString());
+            return true;
+        } else {
+            return false;
+        }
+        if (rc) settleChain(*rc, cont->nestDepth);
+        return true;
     }
 
     void writeBack(Expr* target, Value v, const SourceRange& r) {
@@ -626,56 +825,19 @@ private:
     void execImportEmbrModule(const std::string& rawPath, const SourceRange& r) {
         namespace fs = std::filesystem;
 
-        fs::path p(rawPath);
+        auto cands = fileCandidates(rawPath, interp.scriptDir, ".embr", "modules");
+        fs::path resolved = findExistingCandidate(cands);
+        if (resolved.empty())
+            error("cannot find module \"" + rawPath + "\"\n  tried:" + describeCandidates(cands), r);
 
-        auto withEmbr = [](fs::path base) -> fs::path {
-            if (base.extension() == ".embr") return base;
-            return fs::path(base.string() + ".embr");
-        };
-
-        std::vector<fs::path> cands;
-        if (p.is_absolute()) {
-            cands.push_back(withEmbr(p));
-        } else if (p.has_parent_path()) {
-            fs::path withE = withEmbr(p);
-            if (!interp.scriptDir.empty())
-                cands.push_back((fs::path(interp.scriptDir) / withE).lexically_normal());
-            cands.push_back((fs::current_path() / withE).lexically_normal());
-        } else {
-            fs::path name = withEmbr(p);
-            if (!interp.scriptDir.empty()) {
-                fs::path base(interp.scriptDir);
-                cands.push_back(base / name);
-                cands.push_back(base / "modules" / name);
-            }
-            cands.push_back(fs::current_path() / name);
-            cands.push_back(fs::current_path() / "modules" / name);
-        }
-
-        fs::path resolved;
-        for (const auto& c : cands) {
-            std::error_code ec;
-            if (fs::exists(c, ec) && !ec) { resolved = c; break; }
-        }
-        if (resolved.empty()) {
-            std::string tried;
-            for (const auto& c : cands) tried += "\n    " + c.string();
-            error("cannot find module \"" + rawPath + "\"\n  tried:" + tried, r);
-        }
-
-        std::error_code ec;
-        fs::path canon = fs::canonical(resolved, ec);
-        if (ec) canon = resolved;
-        const std::string canonStr = canon.string();
+        const std::string canonStr = canonicalOrSelf(resolved);
 
         // deduplication
         if (interp.loadedModules_.count(canonStr)) return;
         interp.loadedModules_.insert(canonStr);
 
-        // read source
-        std::ifstream f(resolved);
-        if (!f) error("cannot open module file: " + resolved.string(), r);
-        std::string src((std::istreambuf_iterator<char>(f)), {});
+        auto src = tryReadFile(resolved);
+        if (!src) error("cannot open module file: " + resolved.string(), r);
 
         // save interpreter context fields that runSource overwrites
         std::string savedDir  = interp.scriptDir;
@@ -689,7 +851,7 @@ private:
 
         // parse & run inside the module scope
         try {
-            Lexer     lex(src);
+            Lexer     lex(*src);
             auto      tokens = lex.tokenize();
             SourceMap sm     = lex.sourceMap();
             Parser    parser(std::move(tokens), sm);
@@ -704,86 +866,29 @@ private:
             throw;
         }
 
-        // pop module scope and collect the exported bindings
-        auto [moduleScope, moduleLocals] = interp.popModuleScope();
+        // pop module scope and export its non-local bindings into the
+        // importer's current scope (import statement semantics, see
+        // exportModuleScope's own comment for why this differs from load_module())
+        auto res = interp.popModuleScope();
 
         // restore interpreter context
         interp.scriptDir = savedDir;
         interp.setSource(savedMap, savedFile);
 
-        // copy non-local bindings into the importer's current scope
-        for (auto& [name, val] : moduleScope) {
-            if (!moduleLocals.count(name))
-                interp.define(name, std::move(val));
-        }
+        exportModuleScope(interp, std::move(res), /*mutateCallerScope=*/true);
     }
 
     // import a native plugin (.so / .dll / .dylib)
     void execImportPlugin(const std::string& rawPath, const SourceRange& r) {
-        namespace fs = std::filesystem;
-
-        fs::path p(rawPath);
-
-        auto withExt = [&](fs::path base) -> fs::path {
-            if (base.extension() == PLUGIN_EXT) return base;
-            return fs::path(base.string() + PLUGIN_EXT);
-        };
-
-        std::vector<fs::path> cands;
-
-        if (p.is_absolute()) {
-            cands.push_back(withExt(p));
-
-        } else if (p.has_parent_path()) {
-            fs::path withE = withExt(p);
-            if (!interp.scriptDir.empty())
-                cands.push_back((fs::path(interp.scriptDir) / withE).lexically_normal());
-            cands.push_back((fs::current_path() / withE).lexically_normal());
-
-        } else {
-            fs::path name = withExt(p);  // just the filename
-            if (!interp.scriptDir.empty()) {
-                fs::path base(interp.scriptDir);
-                cands.push_back(base / name);                   // next to the script
-                cands.push_back(base / "plugins" / name);       // plugins/ subdir
-            }
-            cands.push_back(fs::current_path() / name);         // cwd
-            cands.push_back(fs::current_path() / "plugins" / name); // cwd/plugins/
-        }
-
-        PluginHandle handle = nullptr;
-        std::string  loadedFrom;
-        for (const auto& c : cands) {
-            handle = pluginOpen(c.string().c_str());
-            if (handle) { loadedFrom = c.string(); break; }
-        }
-
-        if (!handle) {
-            // list of tried paths for the error message
-            std::string tried;
-            for (const auto& c : cands) tried += "\n    " + c.string();
-            error("cannot load plugin \"" + rawPath + "\": " + pluginError() +
-                  "\n  tried:" + tried, r);
-        }
-
-        using RegFn = void(*)(Interpreter*);
-        auto reg = reinterpret_cast<RegFn>(pluginSym(handle, "embr_register"));
-        if (!reg) {
-            pluginClose(handle);
-            error("'embr_register' not found in \"" + loadedFrom + "\"", r);
-        }
-        try {
-            reg(&interp);
-            interp.pluginHandles_.push_back(handle);
-        }
-        catch (...) {
-            pluginClose(handle);
-            throw;
-        }
-        std::cout << "[runtime] loaded plugin: " << loadedFrom << "\n";
+        // locating, policy-checking (sandbox allow-list) and registering a plugin all live in
+        // importNativePlugin() (module.h), shared with the VM so neither backend can bypass the policy
+        std::string err = importNativePlugin(interp, rawPath);
+        if (!err.empty()) error(err, r);
     }
 };
 
+// compile and run in one call. an uncaught EmbrError stops the rest of src and is printed once here, same as
+// vm::runSource, so a caller doesn't need to know which backend it got
 inline void runSource(const std::string& src, Interpreter& interp,
                       const std::string& filename = "<input>") {
     Lexer lex(src);
@@ -796,7 +901,11 @@ inline void runSource(const std::string& src, Interpreter& interp,
     const std::vector<StmtPtr>* stable = interp.storeProgram(std::move(prog));
 
     Runner runner(interp);
-    runner.run(*stable, sm, filename);
+    try {
+        runner.run(*stable, sm, filename);
+    } catch (const EmbrError& e) {
+        std::cerr << e.what() << formatTrace(e);
+    }
 }
 
 } // namespace embr

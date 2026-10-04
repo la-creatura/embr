@@ -1,0 +1,14 @@
+# plain call overhead: many small non-recursive calls
+fn add(a, b)
+    return a + b
+end
+fn twice(x)
+    return add(x, x)
+end
+acc = 0
+i = 0
+while i < 600000
+    acc = add(acc, twice(i))
+    i = i + 1
+end
+print(acc)

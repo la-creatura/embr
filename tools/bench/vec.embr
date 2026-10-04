@@ -1,0 +1,21 @@
+# vec: build a 200k element vec with push, then update and read every element a few times.
+# the same job with a plain array is O(n^2), see array.embr (3k elements)
+import "vec"
+v = vec()
+i = 0
+while i < 200000
+    vec_push(v, i)
+    i = i + 1
+end
+total = 0
+r = 0
+while r < 3
+    i = 0
+    while i < 200000
+        vec_set(v, i, vec_get(v, i) + 1)
+        total = total + vec_get(v, i)
+        i = i + 1
+    end
+    r = r + 1
+end
+print(total)

@@ -3,21 +3,58 @@
 
 // shared driver for embr's CTest-based unit test executables
 //
-// each plugin (and the core language) gets its own small executable built from a single .cpp that #includes this header
+// each plugin (and the core language) gets its own small executable built from a single .cpp that
+// #includes this header
 // calls runSuite() with its own list of Tests and the plugins it needs imported
 // keeping each translation unit small means editing one plugin's tests only recompiles and relinks that one binary
 
 #include <embr/embr.h>
+
+// the C library to ffi_open() in tests that call real libc functions (strlen, qsort, abs, printf, ...)
+#if defined(__APPLE__)
+#  define EMBR_TEST_LIBC "libSystem.B.dylib"
+#elif defined(_WIN32)
+#  define EMBR_TEST_LIBC "msvcrt.dll"
+#else
+#  define EMBR_TEST_LIBC "libc.so.6"
+#endif
+
+// the EMBR_PATH entry separator
+#ifdef _WIN32
+#  define EMBR_TEST_PATHSEP ";"
+#else
+#  define EMBR_TEST_PATHSEP ":"
+#endif
+
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include <cstdlib>
+
 namespace embr_test {
 
-// these suites exercise language/stdlib behavior so they run against whichever backend the build was configured with 
+// these suites exercise language/stdlib behavior against one backend at a time
+// with both compiled in, EMBR_TEST_BACKEND=vm|tree picks one at runtime (default: tree-walker)
+// tests/CMakeLists.txt registers every suite twice (<name>_tw / <name>_vm) using this
+inline bool useVmBackend() {
+#if defined(EMBR_WITH_TREE_WALKER) && defined(EMBR_WITH_VM)
+    const char* e = std::getenv("EMBR_TEST_BACKEND");
+    return e && std::string(e) == "vm";
+#elif defined(EMBR_WITH_VM)
+    return true;
+#else
+    return false;
+#endif
+}
+
 inline void runSourceAny(const std::string& src, embr::Interpreter& interp,
                          const std::string& filename) {
-#ifdef EMBR_WITH_TREE_WALKER
+#if defined(EMBR_WITH_TREE_WALKER) && defined(EMBR_WITH_VM)
+    if (useVmBackend()) embr::vm::runSource(src, interp, filename);
+    else                embr::runSource(src, interp, filename);
+#elif defined(EMBR_WITH_TREE_WALKER)
     embr::runSource(src, interp, filename);
 #elif defined(EMBR_WITH_VM)
     embr::vm::runSource(src, interp, filename);
@@ -80,14 +117,17 @@ inline void printResult(const Result& r) {
 
 // runs tests against a fresh Interpreter that has already import()ed each name in plugins
 // individual Test::code strings should NOT re-import the same plugin
-// or its "[runtime] loaded plugin: " banner will pollute the captured stdout an exact-match test compares against
+// (the "[runtime] loaded plugin: " banner goes to stderr, which this harness does not capture, so a
+// re-import no longer pollutes the compared stdout -- it is just redundant work)
 // prints a summary and returns a process exit code (0 = all passed) that CTest reads as pass/fail
+// (std::cout is made unbuffered by runSuite, so a test that hangs still shows how far the suite got)
 inline int runSuite(const std::string& suiteName,
                      const std::vector<Test>& tests,
                      const std::vector<std::string>& plugins = {}) {
 #ifdef _WIN32
     embr::enableAnsi();
 #endif
+    std::cout << std::unitbuf;
     embr::Interpreter interp;
     for (const auto& p : plugins)
         runSourceAny("import \"" + p + "\"", interp, "");

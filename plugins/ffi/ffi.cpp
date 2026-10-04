@@ -1,286 +1,293 @@
 // ffi.cpp
-// foreign function interface plugin for embr
+// foreign function interface plugin for embr: call C functions from a shared library
 //
 // usage
+//   import "embrtypes"   # for type descriptors: type_i32(), type_ptr(), etc
 //   import "ffi"
+//   lib = ffi_open("libc.so.6")
+//   sym = ffi_sym(lib, "strlen")
+//   print(ffi_call(sym, type_i64(), [type_str()], ["hello"]))
 //
+// good to know
+//   - every handle given to a script (library, symbol, prepared call, callback) is a typed pointer/userdata (see
+//     TypedPtr in core/value.h), never a map, so a script can't forge one. asPointer(expectedType) raises on a tag mismatch
+//   - type descriptors (the `ret`/`arg_types` arguments) are plugins/embrtypes/embrtypes.h's TypeDesc, shared by a
+//     plain #include. ffi.so doesn't need embrtypes.so loaded, but a script must import embrtypes to build them
+//   - usable in a call: i8..f64, ptr, str (passed as a C string), and structs built from those. the other kinds
+//     (arr, map, fn, union, untyped) raise a clear error
+//   - `ret` can be `nil` to mean "returns nothing" (void isn't a value shape, so embrtypes has no type_void())
+//   - out-parameters are embrtypes' buffer(): a buffer's pointer is its byte data's address, so it works directly
+//     as a `ptr` argument, or with ptr_read/ptr_write/buffer_pack/buffer_unpack
 
 #include <embr/embr.h>
+#include "../embrtypes/embrtypes.h"
 #include <ffi.h>
 #include <cstring>
 #include <cstdlib>
+#include <memory>
+#include <algorithm>
+#include <exception>
+#include <cmath>
 
 using namespace embr;
+using TypeDesc = embrtypes::TypeDesc;
 
 static Param pAny(std::string n)                      { return Param::req(std::move(n), TS::Any); }
 static Param pStr(std::string n)                      { return Param::req(std::move(n), TS::Str); }
+static Param pNum(std::string n)                      { return Param::req(std::move(n), TS::Num); }
 static Param pArr(std::string n)                      { return Param::req(std::move(n), TS::Arr); }
-static Param pMap(std::string n)                      { return Param::req(std::move(n), TS::Map); }
 static Param pFn (std::string n)                      { return Param::req(std::move(n), TS::Fn);  }
 static Param pPtr(std::string n)                      { return Param::req(std::move(n), TS::Ptr); }
 static Param pOpt(std::string n, TypeSet m = TS::Any) { return Param::opt(std::move(n), m);       }
 
 // allocated once at registration time, captured by shared_ptr into every bound lambda
 // lives as long as global scope
-
 struct FFIState {
 
-    struct LibEntry {
-        PluginHandle handle;
+    // sole strong owner of an open library. ffi_close() erasing the map
+    // entry below drops the only shared_ptr to it, running ~LibHandle (and
+    // therefore pluginClose) immediately, real, synchronous close
+    // semantics, not "whenever the last reference happens to go away".
+    struct LibHandle {
+        PluginHandle handle = nullptr;
         std::string  path;
+        ~LibHandle() { if (handle) pluginClose(handle); }
+    };
+    std::unordered_map<const void*, std::shared_ptr<LibHandle>> libs;
+
+    // a symbol resolved from a library. holds only a *weak* reference to the
+    // owning LibHandle, it must not keep a closed library's mapping alive,
+    // but ffi_call/ffi_invoke need to detect a closed library and raise a
+    // catchable error instead of jumping into unmapped memory.
+    struct SymHandle {
+        void*                    fnptr = nullptr;
+        std::string              name;
+        std::weak_ptr<LibHandle> lib;
     };
 
-    std::unordered_map<uintptr_t, LibEntry> libs;
-
-    // ffi_ref out-parameter buffers
-    struct RefEntry {
-        std::vector<uint8_t> buf;
-        Value                desc;  // type descriptor
-    };
-    std::unordered_map<uint64_t, std::unique_ptr<RefEntry>> refs;
-    uint64_t nextRefKey = 1;
-
-    // libffi callback closure fwd declare
+    // a C-callable trampoline made by ffi_callback(). C code may keep the raw executable pointer without any embr Value
+    // (after registering it with a callback API), so unlike sym/prepared this is not refcounted: it lives until
+    // ffi_callback_free is called
     struct CallbackEntry;
-    std::unordered_map<uint64_t, std::unique_ptr<CallbackEntry>> callbacks;
-    uint64_t nextCallbackKey = 1;
+    std::unordered_map<const void*, std::unique_ptr<CallbackEntry>> callbacks;
 
-    // cached (prepared) calls see ffi_prepare/ffi_invoke below
-    // a ffi_cif built once via ffi_prep_cif and reused across many ffi_invoke() calls instead of ffi_call() which rebuilds one every time
+    // a cif + resolved descriptors cached by ffi_prepare() for repeated
+    // ffi_invoke() calls. refcounted (unlike callbacks): nothing outside
+    // embr holds a raw pointer to a PreparedCall, so it's safe to free
+    // automatically once the last Value referencing it is dropped.
     struct PreparedCall;
-    std::unordered_map<uint64_t, std::unique_ptr<PreparedCall>> prepared;
-    uint64_t nextPreparedKey = 1;
 
-    // destructor is defined after CallbackEntry/PreparedCall are complete
     ~FFIState();
 };
 
-// type descriptors
-//   __type_desc  "yes"     detect misuse
-//   name         string    readable name
-//   size         number    sizeof in bytes; 0 for void
-//   signed       0|1
-//   float        0|1
-//   pointer      0|1       true for both ptr and cstr
-//   string       0|1       true only for cstr (triggers char* auto-marshal)
+// void isn't a TypeDesc kind embrtypes.cpp itself exposes (see the file
+// header comment), scripts spell "no return value" as `nil` for ret, and
+// this plugin maps that to its own single, process-lifetime Void descriptor.
+static const TypeDesc g_voidDesc = embrtypes::kindOnly(TypeDesc::Kind::Void);
 
-static Value makeTypeDesc(const std::string& name,
-                          size_t sz,
-                          bool isSigned,
-                          bool isFloat,
-                          bool isPointer,
-                          bool isString)
-{
-    Value::map_type m;
-    m["__type_desc"] = Value(std::string("yes"));
-    m["name"]        = Value(name);
-    m["size"]        = Value((double)sz);
-    m["signed"]      = Value(isSigned  ? 1.0 : 0.0);
-    m["float"]       = Value(isFloat   ? 1.0 : 0.0);
-    m["pointer"]     = Value(isPointer ? 1.0 : 0.0);
-    m["string"]      = Value(isString  ? 1.0 : 0.0);
-    return Value(std::move(m));
-}
-
-static void registerTypeConstants(Interpreter& interp) {
-    interp.define("ffi_i8",    makeTypeDesc("i8",   1, true,  false, false, false));
-    interp.define("ffi_i16",   makeTypeDesc("i16",  2, true,  false, false, false));
-    interp.define("ffi_i32",   makeTypeDesc("i32",  4, true,  false, false, false));
-    interp.define("ffi_i64",   makeTypeDesc("i64",  8, true,  false, false, false));
-    interp.define("ffi_u8",    makeTypeDesc("u8",   1, false, false, false, false));
-    interp.define("ffi_u16",   makeTypeDesc("u16",  2, false, false, false, false));
-    interp.define("ffi_u32",   makeTypeDesc("u32",  4, false, false, false, false));
-    interp.define("ffi_u64",   makeTypeDesc("u64",  8, false, false, false, false));
-
-    interp.define("ffi_size_t",  makeTypeDesc("size_t",  sizeof(size_t),        false, false, false, false));
-    interp.define("ffi_ssize_t", makeTypeDesc("ssize_t", sizeof(ptrdiff_t),     true,  false, false, false));
-    interp.define("ffi_long",    makeTypeDesc("long",    sizeof(long),           true,  false, false, false));
-    interp.define("ffi_ulong",   makeTypeDesc("ulong",   sizeof(unsigned long),  false, false, false, false));
-    interp.define("ffi_intptr",  makeTypeDesc("intptr",  sizeof(intptr_t),       true,  false, false, false));
-    interp.define("ffi_uintptr", makeTypeDesc("uintptr", sizeof(uintptr_t),      false, false, false, false));
-
-    interp.define("ffi_f32",   makeTypeDesc("f32",  4, true, true,  false, false));
-    interp.define("ffi_f64",   makeTypeDesc("f64",  8, true, true,  false, false));
-
-    interp.define("ffi_ptr",   makeTypeDesc("ptr",  sizeof(void*), false, false, true,  false));
-    interp.define("ffi_cstr",  makeTypeDesc("cstr", sizeof(void*), false, false, true,  true ));
-
-    interp.define("ffi_void",  makeTypeDesc("void", 0, false, false, false, false));
-}
-
-static void requireTypeDesc(const Value& v,
-                             const std::string& caller,
-                             const std::string& argname)
-{
-    if (!v.isMap() || !v.asMap().count("__type_desc"))
-        raiseError(caller, "'" + argname + "' must be a type descriptor "
-                   "(ffi_i32, ffi_ptr, ffi_void, ...) got " + v.typeName());
-}
-
-// resolved, POD-only view of a type descriptor.
-// the embr-level type descriptors above are plain maps and reading them is five string-keyed hash lookups every time
-// TypeInfo is resolved from a descriptor exactly once and from then on marshalArg/unmarshalReturn only touch plain struct fields.
-struct TypeInfo {
-    std::string name;
-    size_t      size      = 0;
-    bool        isSigned  = false;
-    bool        isFloat   = false;
-    bool        isPointer = false;
-    bool        isString  = false;
+// a TypeDesc argument plus whatever keeps it alive. requireDesc() returns a raw pointer into the Value's TypedPtr
+// payload, fine for one ffi_call/ffi_callback invocation. ffi_prepare/ffi_callback store the descriptor for
+// reuse, so they also hold the shared_ptr the Value's TypedPtr held (from asPointer().owner). nil (void) has no
+// owner, g_voidDesc is static
+struct DescRef {
+    const TypeDesc*                    ptr = &g_voidDesc;
+    std::shared_ptr<const TypeDesc>    owner; // null for g_voidDesc, non-null otherwise
 };
-
-static TypeInfo resolveTypeInfo(const Value::map_type& desc) {
-    return TypeInfo{
-        desc.at("name").asString(),
-        (size_t)desc.at("size").asNumber(),
-        desc.at("signed").truthy(),
-        desc.at("float").truthy(),
-        desc.at("pointer").truthy(),
-        desc.at("string").truthy()
-    };
+static DescRef resolveDescArg(const Value& v, const std::string& caller, const std::string& argname) {
+    if (embrtypes::isNil(v)) return {};
+    const TypeDesc* raw = embrtypes::requireDesc(v, caller, argname);
+    return DescRef{raw, std::static_pointer_cast<const TypeDesc>(v.asPointer().owner)};
 }
 
-static ffi_type* descToFFIType(const TypeInfo& info) {
-    size_t sz     = info.size;
-    bool isFloat  = info.isFloat;
-    bool isSigned = info.isSigned;
-    bool isPtr    = info.isPointer;
+// libffi needs a stable-address ffi_type (and elements[] array) for as long as a cif uses it. for a struct from
+// struct_type() this plugin builds and caches one, keyed by the TypeDesc's own stable heap address (embrtypes
+// knows nothing about libffi)
+struct StructFFI { ffi_type type{}; std::vector<ffi_type*> elements; };
+// thread_local, not one shared static: a plain static would be an unsynchronized map written by every thread that
+// marshals a struct type (see g_rng in embrmath.cpp). a TypeDesc* key only matters to the thread that made it, so
+// each thread building its own entry costs one rebuild per thread, which beats a data race
+static thread_local std::unordered_map<const void*, std::unique_ptr<StructFFI>> g_structFFICache;
 
-    if (sz == 0)            return &ffi_type_void;
-    if (isPtr)              return &ffi_type_pointer;
-    if (isFloat && sz == 4) return &ffi_type_float;
-    if (isFloat && sz == 8) return &ffi_type_double;
+static ffi_type* descToFFIType(const TypeDesc& d) {
+    using Kind = TypeDesc::Kind;
+    if (d.kind == Kind::Void) return &ffi_type_void;
+    if (d.kind == Kind::Ptr || d.kind == Kind::Str) return &ffi_type_pointer;
 
-    if (isSigned) {
-        switch (sz) {
-            case 1: return &ffi_type_sint8;
-            case 2: return &ffi_type_sint16;
-            case 4: return &ffi_type_sint32;
-            case 8: return &ffi_type_sint64;
-        }
-    } else {
-        switch (sz) {
-            case 1: return &ffi_type_uint8;
-            case 2: return &ffi_type_uint16;
-            case 4: return &ffi_type_uint32;
-            case 8: return &ffi_type_uint64;
+    if (d.kind == Kind::Struct) {
+        if (d.structSize == 0)
+            raiseError("ffi", "struct '" + embrtypes::describe(d) +
+                       "' has a non-fixed-width field and cannot be used in an ffi call");
+        auto it = g_structFFICache.find(&d);
+        if (it != g_structFFICache.end()) return &it->second->type;
+
+        auto sf = std::make_unique<StructFFI>();
+        sf->elements.reserve(d.fields.size() + 1);
+        for (auto& f : d.fields) sf->elements.push_back(descToFFIType(*f.type));
+        sf->elements.push_back(nullptr); // libffi requires a null-terminated elements array
+        sf->type.size      = d.structSize;
+        sf->type.alignment = (unsigned short)d.structAlignment;
+        sf->type.type      = FFI_TYPE_STRUCT;
+        sf->type.elements  = sf->elements.data();
+
+        ffi_type* result = &sf->type;
+        g_structFFICache[&d] = std::move(sf);
+        return result;
+    }
+
+    embrtypes::FixedWidth w;
+    if (embrtypes::fixedWidth(d.kind, w)) {
+        if (w.isFloat) return w.size == 4 ? &ffi_type_float : &ffi_type_double;
+        if (w.isSigned) {
+            switch (w.size) {
+                case 1: return &ffi_type_sint8;  case 2: return &ffi_type_sint16;
+                case 4: return &ffi_type_sint32; case 8: return &ffi_type_sint64;
+            }
+        } else {
+            switch (w.size) {
+                case 1: return &ffi_type_uint8;  case 2: return &ffi_type_uint16;
+                case 4: return &ffi_type_uint32; case 8: return &ffi_type_uint64;
+            }
         }
     }
-    raiseError("ffi", "no libffi type for descriptor '" + info.name + "'");
+    raiseError("ffi", "type '" + embrtypes::describe(d) + "' cannot be used in an ffi call "
+               "(only i8..f64, ptr, str, nil (as ret, meaning void), and structs built from these are supported)");
+}
+
+// a descriptor's byte size for buffer-sizing purposes (argument slots, the
+// return buffer), distinct from embrtypes::packedSize() because ptr/str
+// (sizeof(void*)) and Void (0) are meaningful sizes here but aren't
+// "packable" in embrtypes' own sense.
+static size_t descByteSize(const TypeDesc& d) {
+    using Kind = TypeDesc::Kind;
+    if (d.kind == Kind::Void) return 0;
+    if (d.kind == Kind::Ptr || d.kind == Kind::Str) return sizeof(void*);
+    if (d.kind == Kind::Struct) return d.structSize;
+    embrtypes::FixedWidth w;
+    return embrtypes::fixedWidth(d.kind, w) ? w.size : 0;
+}
+
+// a script-supplied double -> int64_t without the undefined behaviour of a
+// raw (int64_t) cast on NaN/Inf/out-of-range input. raises instead.
+static int64_t doubleToInt64(double x, const std::string& context, const std::string& what) {
+    // 2^63 is exactly representable as a double; valid range is [-2^63, 2^63)
+    if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0))
+        raiseError(context, what + ": number " + std::to_string(x) + " is out of integer range");
+    return (int64_t)x;
+}
+
+// an error thrown by a script callback while C code (qsort, a signal-style API, ...) is on the stack must not unwind
+// through those C frames (undefined behavior, usually an abort). the trampoline catches it here and performCall
+// rethrows it after ffi_call returns normally. thread_local because each embr thread runs its own ffi_calls
+static thread_local std::exception_ptr g_pendingCallbackError;
+
+static int64_t nfixedArg(const Value& v, const std::string& context) {
+    int64_t n = doubleToInt64(v.asNumber(), context, "nfixed");
+    if (n < 0) raiseError(context, "nfixed cannot be negative");
+    return n;
 }
 
 // raw memory -> Value
-// used for ffi_call/ffi_invoke return values, ffi_deref, ptr_read, and
+// used for ffi_call/ffi_invoke return values, ptr_read, and
 // unmarshalling callback arguments
 //
 // libffi promotes integer return values smaller than ffi_arg (register width) into full ffi_arg-sized slot
 // must read ffi_arg and then narrow rather than reading only sz bytes
 // otherwise get garbage on big-endian platforms and potential reads of uninitialised memory on little-endian ones
-static Value unmarshalReturn(const TypeInfo& info, const void* buf) {
-    size_t sz     = info.size;
-    bool isFloat  = info.isFloat;
-    bool isSigned = info.isSigned;
-    bool isPtr    = info.isPointer;
-    bool isStr    = info.isString;
+static Value unmarshalReturn(const TypeDesc& d, const void* buf) {
+    using Kind = TypeDesc::Kind;
+    if (d.kind == Kind::Void) return Value(0.0);
 
-    if (sz == 0)  return Value(0.0);  // void
+    if (d.kind == Kind::Struct) {
+        Value::map_type m;
+        for (auto& f : d.fields) m[f.name] = unmarshalReturn(*f.type, (const uint8_t*)buf + f.offset);
+        return Value(std::move(m));
+    }
 
-    if (isStr) {
+    if (d.kind == Kind::Str) {
         const char* s; memcpy(&s, buf, sizeof(char*));
         return Value(s ? std::string(s) : std::string(""));
     }
 
-    if (isPtr) {
+    if (d.kind == Kind::Ptr) {
         void* p; memcpy(&p, buf, sizeof(void*));
         return Value::makePointer(p);
     }
 
-    if (isFloat) {
-        if (sz == 4) { float  f; memcpy(&f, buf, 4); return Value((double)f); }
-        else         { double f; memcpy(&f, buf, 8); return Value(f); }
+    embrtypes::FixedWidth w;
+    if (!embrtypes::fixedWidth(d.kind, w))
+        raiseError("ffi", "type '" + embrtypes::describe(d) + "' cannot be used as an ffi return type");
+
+    if (w.isFloat) {
+        if (w.size == 4) { float  f; memcpy(&f, buf, 4); return Value((double)f); }
+        else              { double f; memcpy(&f, buf, 8); return Value(f); }
     }
 
-    // returned as an exact int64 (not double) so large 64-bit C values round
-    // trip precisely instead of losing precision above 2^53. a uint64 whose
-    // value exceeds INT64_MAX still can't be represented exactly -- embr has
-    // one signed 64-bit integer type, not a separate unsigned one -- but this
-    // is still a strict improvement over the previous silent double truncation.
-    if (isSigned) {
-        switch (sz) {
+    // returned as an exact int64, not double, so large 64-bit C values keep their precision above 2^53. a uint64
+    // above INT64_MAX still can't be exact (embr has one signed 64-bit int type)
+    if (w.isSigned) {
+        switch (w.size) {
             case 1: { ffi_sarg v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(int8_t)v);  }
             case 2: { ffi_sarg v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(int16_t)v); }
             case 4: { int32_t  v; memcpy(&v, buf, 4);         return Value((int64_t)v); }
             case 8: { int64_t  v; memcpy(&v, buf, 8);         return Value(v); }
         }
     } else {
-        switch (sz) {
+        switch (w.size) {
             case 1: { ffi_arg  v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(uint8_t)v);  }
             case 2: { ffi_arg  v; memcpy(&v, buf, sizeof(v)); return Value((int64_t)(uint16_t)v); }
             case 4: { uint32_t v; memcpy(&v, buf, 4);         return Value((int64_t)v); }
             case 8: { uint64_t v; memcpy(&v, buf, 8);         return Value((int64_t)v); }
         }
     }
-    raiseError("ffi", "unmarshal: unsupported size " + std::to_string(sz));
+    raiseError("ffi", "unmarshal: unsupported width " + std::to_string(w.size));
 }
 
 // Value -> raw memory slot
-//
-// slot points to kSlotSize bytes of pre-zeroed storage owned by the caller's argStorage vector
-// the vector must not reallocate between this call and ffi_call
-// keepalive receives any heap allocations (cstrings) that must outlive the call and the caller frees them afterwards
-//
-// context is the calling native fn's name ("ffi_call" / "ffi_invoke"), used
-// only to label error messages correctly for whichever path is calling in
-static constexpr size_t kSlotSize = 8;  // sizeof largest scalar aligns to pointer
-
+// slot points at at least descByteSize(info) bytes of zeroed storage owned by the caller's argStorage vector, which
+// must not reallocate before ffi_call. keepalive collects heap allocations (marshaled strings) that must outlive
+// the call, the caller frees them afterwards. context is the calling native's name, for error messages
 static void marshalArg(const std::string&     context,
                        const Value&            val,
-                       const TypeInfo&         info,
+                       const TypeDesc&         d,
                        void*                   slot,
                        std::vector<void*>&     keepalive,
-                       const FFIState&         ffi_state,
                        size_t                  argIdx)
 {
-    const std::string  argLabel = "arg[" + std::to_string(argIdx) + "]";
-    const std::string& tname    = info.name;
-    size_t sz      = info.size;
-    bool isFloat   = info.isFloat;
-    bool isSigned  = info.isSigned;
-    bool isPtr     = info.isPointer;
-    bool isStr     = info.isString;
+    using Kind = TypeDesc::Kind;
+    const std::string argLabel = "arg[" + std::to_string(argIdx) + "]";
+    const std::string tname    = embrtypes::describe(d);
 
-    // ref passed as out-parameter pointer
-    // must be checked before the generic pointer path so can look up the actual buffer address
-    if (val.isMap()) {
-        const auto& vm = val.asMap();
-        if (vm.count("__type") && vm.at("__type").asString() == "ref") {
-            if (!isPtr)
-                raiseError(context, argLabel + ": passing a ref requires a pointer "
-                           "type descriptor, got " + tname);
-            uint64_t key = (uint64_t)vm.at("__key").asNumber();
-            auto it = ffi_state.refs.find(key);
-            if (it == ffi_state.refs.end())
-                raiseError(context, argLabel + ": ref has been freed");
-            void* bufptr = it->second->buf.data();
-            memcpy(slot, &bufptr, sizeof(void*));
-            return;
+    // struct passed by value: slot is sized to the whole struct (see
+    // performCall's per-arg slot sizing) and each field marshals into its
+    // own offset within it, recursively, so a struct field can itself be
+    // another struct
+    if (d.kind == Kind::Struct) {
+        if (!val.isMap())
+            raiseError(context, argLabel + ": expects struct '" + tname + "', got " + val.typeName());
+        const auto& fields = val.asMap();
+        for (auto& f : d.fields) {
+            auto it = fields.find(f.name);
+            if (it == fields.end())
+                raiseError(context, argLabel + ": struct '" + tname + "' missing field '" + f.name + "'");
+            marshalArg(context, it->second, *f.type, (uint8_t*)slot + f.offset, keepalive, argIdx);
         }
+        return;
     }
 
-    // str -> malloc'd null-terminated buffer
-    if (isStr) {
+    // str -> malloc'd null-terminated buffer (freed by performCall after the call)
+    if (d.kind == Kind::Str) {
         if (!val.isString())
-            raiseError(context, argLabel + ": expects cstr, got " + val.typeName());
+            raiseError(context, argLabel + ": expects a string, got " + val.typeName());
         const std::string& s = val.asString();
         char* buf = (char*)malloc(s.size() + 1);
-        if (!buf) raiseError(context, argLabel + ": malloc failed for cstr argument");
+        if (!buf) raiseError(context, argLabel + ": malloc failed for string argument");
         memcpy(buf, s.data(), s.size() + 1);
         keepalive.push_back(buf);
         memcpy(slot, &buf, sizeof(void*));
         return;
     }
 
-    if (isPtr) {
+    if (d.kind == Kind::Ptr) {
         if (!val.isPointer())
             raiseError(context, argLabel + ": expects ptr, got " + val.typeName());
         void* p = val.asPointer().ptr;
@@ -288,12 +295,16 @@ static void marshalArg(const std::string&     context,
         return;
     }
 
-    if (isFloat) {
+    embrtypes::FixedWidth w;
+    if (!embrtypes::fixedWidth(d.kind, w))
+        raiseError(context, argLabel + ": type '" + tname + "' cannot be used as an ffi argument");
+
+    if (w.isFloat) {
         if (!val.isNumeric())
             raiseError(context, argLabel + ": expects " + tname + ", got " + val.typeName());
-        double d = val.asNumber();
-        if (sz == 4) { float f = (float)d; memcpy(slot, &f, 4); }
-        else         {                     memcpy(slot, &d, 8); }
+        double x = val.asNumber();
+        if (w.size == 4) { float f = (float)x; memcpy(slot, &f, 4); }
+        else              {                     memcpy(slot, &x, 8); }
         return;
     }
 
@@ -306,61 +317,131 @@ static void marshalArg(const std::string&     context,
     if (val.isInt()) {
         iv = val.asInt();
     } else {
-        double d = val.asNumber();
-        iv = (int64_t)d;
-        if ((double)iv != d)
+        double x = val.asNumber();
+        iv = doubleToInt64(x, context, argLabel);
+        if ((double)iv != x)
             raiseError(context, argLabel + ": type " + tname +
-                       " is integer but got non-integer value " + std::to_string(d));
+                       " is integer but got non-integer value " + std::to_string(x));
     }
-    if (!isSigned && iv < 0)
+    if (!w.isSigned && iv < 0)
         raiseError(context, argLabel + ": type " + tname +
                    " is unsigned but got negative value");
-    switch (sz) {
+    switch (w.size) {
         case 1: { uint8_t  v=(uint8_t) iv; memcpy(slot,&v,1); } break;
         case 2: { uint16_t v=(uint16_t)iv; memcpy(slot,&v,2); } break;
         case 4: { uint32_t v=(uint32_t)iv; memcpy(slot,&v,4); } break;
         case 8: { uint64_t v=(uint64_t)iv; memcpy(slot,&v,8); } break;
-        default: raiseError(context, argLabel + ": unsupported integer size " +
-                            std::to_string(sz));
     }
 }
 
 // shared marshal -> ffi_call -> unmarshal sequence used by both the one-shot ffi_call() and the cached ffi_invoke() paths
 //
-// ffi_call() builds a fresh cif + TypeInfo array right before calling this
-// ffi_invoke() passes in the cif + TypeInfo array cached by ffi_prepare()
-static Value performCall(const std::string&           context,
-                         ffi_cif&                      cif,
-                         void*                          fnptr,
-                         const std::vector<TypeInfo>&   argInfo,
-                         const TypeInfo&                retInfo,
-                         const Value::array_type&       argVals,
-                         const FFIState&                ffi_state)
+// ffi_call() builds a fresh cif + descriptor array right before calling this
+// ffi_invoke() passes in the cif + descriptors cached by ffi_prepare()
+static Value performCall(const std::string&                       context,
+                         ffi_cif&                                  cif,
+                         void*                                      fnptr,
+                         const std::vector<const TypeDesc*>&        argInfo,
+                         const TypeDesc&                            retInfo,
+                         const Value::array_type&                   argVals)
 {
     size_t nargs = argInfo.size();
     if (argVals.size() != nargs)
         raiseError(context, "expected " + std::to_string(nargs) +
                    " args, got " + std::to_string(argVals.size()));
 
-    // argStorage is allocated up front so it never reallocates
-    // argptrs array holds pointers into it and must stay valid until after ffi_call returns
-    std::vector<uint8_t> argStorage(nargs * kSlotSize, 0);
-    std::vector<void*>   argptrs(nargs);
-    std::vector<void*>   keepalive;
-
+    // each arg gets a slot of at least kSlotSize bytes, a struct passed by
+    // value can be arbitrarily larger, so slots are sized per-argument and
+    // laid out back to back rather than assuming a uniform stride
+    static constexpr size_t kSlotSize = 8;  // sizeof largest scalar aligns to pointer
+    std::vector<size_t> slotOffset(nargs);
+    size_t totalArgBytes = 0;
     for (size_t i = 0; i < nargs; ++i) {
-        argptrs[i] = argStorage.data() + i * kSlotSize;
-        marshalArg(context, argVals[i], argInfo[i], argptrs[i], keepalive, ffi_state, i);
+        slotOffset[i] = totalArgBytes;
+        totalArgBytes += std::max(kSlotSize, descByteSize(*argInfo[i]));
     }
 
-    // the return buffer must be at least sizeof(ffi_arg) bytes because libffi promotes small integer returns into a register-sized slot
-    // 16 bytes covers all scalars including double and pointer
-    uint8_t retbuf[16] = {};
-    ffi_call(&cif, FFI_FN(fnptr), retbuf, nargs > 0 ? argptrs.data() : nullptr);
+    // argStorage is allocated up front so it never reallocates
+    // argptrs array holds pointers into it and must stay valid until after ffi_call returns
+    std::vector<uint8_t> argStorage(totalArgBytes, 0);
+    std::vector<void*>   argptrs(nargs);
+    // malloc'd string copies; freed on every exit path, including a
+    // marshalArg() raise partway through the argument list
+    struct Keepalive : std::vector<void*> {
+        ~Keepalive() { for (void* p : *this) free(p); }
+    } keepalive;
 
-    for (void* p : keepalive) free(p);
+    for (size_t i = 0; i < nargs; ++i) {
+        argptrs[i] = argStorage.data() + slotOffset[i];
+        marshalArg(context, argVals[i], *argInfo[i], argptrs[i], keepalive, i);
+    }
 
-    return unmarshalReturn(retInfo, retbuf);
+    // the return buffer must be at least sizeof(ffi_arg) bytes because libffi
+    // promotes small integer returns into a register-sized slot; 16 bytes
+    // covers all scalars including double and pointer, but a struct return
+    // can be larger, so size up to fit it too
+    std::vector<uint8_t> retbuf(std::max((size_t)16, descByteSize(retInfo)), 0);
+    if (!fnptr) raiseError(context, "symbol resolved to a null address");
+    g_pendingCallbackError = nullptr;
+    ffi_call(&cif, FFI_FN(fnptr), retbuf.data(), nargs > 0 ? argptrs.data() : nullptr);
+
+    // a script callback invoked during the call failed: surface it now
+    if (g_pendingCallbackError) {
+        std::exception_ptr e = g_pendingCallbackError;
+        g_pendingCallbackError = nullptr;
+        std::rethrow_exception(e);
+    }
+
+    return unmarshalReturn(retInfo, retbuf.data());
+}
+
+// Value -> raw memory at an arbitrary address, per a type descriptor. used by ptr_write and for struct fields
+// (a field can be another struct). a str descriptor is treated like a plain ptr here: the caller passes an
+// already-allocated pointer (from embrtypes' buffer()/ptr_offset), because there is no per-call keepalive to
+// hang a fresh malloc'd copy on, unlike marshalArg
+static void writeValueToMemory(const std::string& context, void* p,
+                               const TypeDesc& d, const Value& v)
+{
+    using Kind = TypeDesc::Kind;
+    if (d.kind == Kind::Struct) {
+        if (!v.isMap())
+            raiseError(context, "value must be a map for struct type '" + embrtypes::describe(d) + "'");
+        const auto& fields = v.asMap();
+        for (auto& f : d.fields) {
+            auto it = fields.find(f.name);
+            if (it == fields.end())
+                raiseError(context, "struct '" + embrtypes::describe(d) + "' missing field '" + f.name + "'");
+            writeValueToMemory(context, (uint8_t*)p + f.offset, *f.type, it->second);
+        }
+        return;
+    }
+    if (d.kind == Kind::Ptr || d.kind == Kind::Str) {
+        if (!v.isPointer())
+            raiseError(context, "value must be a pointer for ptr type");
+        void* q = v.asPointer().ptr;
+        memcpy(p, &q, sizeof(void*));
+        return;
+    }
+    embrtypes::FixedWidth w;
+    if (!embrtypes::fixedWidth(d.kind, w))
+        raiseError(context, "type '" + embrtypes::describe(d) + "' cannot be written to memory");
+    if (w.isFloat) {
+        if (!v.isNumeric())
+            raiseError(context, "value must be a number for float type");
+        double x = v.asNumber();
+        if (w.size == 4) { float f = (float)x; memcpy(p, &f, 4); }
+        else              {                     memcpy(p, &x, 8); }
+    } else {
+        if (!v.isNumeric())
+            raiseError(context, "value must be a number for integer type");
+        int64_t iv = v.isInt() ? v.asInt() : doubleToInt64(v.asNumber(), context, "value");
+        switch (w.size) {
+            case 1: { uint8_t  x=(uint8_t) iv; memcpy(p,&x,1); } break;
+            case 2: { uint16_t x=(uint16_t)iv; memcpy(p,&x,2); } break;
+            case 4: { uint32_t x=(uint32_t)iv; memcpy(p,&x,4); } break;
+            case 8: { uint64_t x=(uint64_t)iv; memcpy(p,&x,8); } break;
+        }
+    }
 }
 
 // placed after marshalArg/unmarshalReturn so the trampoline below can call them
@@ -371,33 +452,63 @@ struct FFIState::CallbackEntry {
     ffi_closure*           closure  = nullptr;  // writable page
     void*                  fnptr    = nullptr;  // executable page
     std::vector<ffi_type*> argFFITypes;
-    std::vector<TypeInfo>  argInfo;             // resolved once at ffi_callback() time
-    TypeInfo                retInfo;
+    std::vector<DescRef>   argDescs;            // resolved once at ffi_callback() time
+    DescRef                retDesc;
     Value                  embrFn;              // keeps the callable alive
     Interpreter*           interp   = nullptr;
+
+    ~CallbackEntry() { if (closure) ffi_closure_free(closure); }
 };
 
-// a symbol + cif prepared once by ffi_prepare(), invoked repeatedly by ffi_invoke() without re-resolving descriptors or calling ffi_prep_cif again
+// a symbol + cif prepared once by ffi_prepare(), invoked repeatedly by ffi_invoke() without re-resolving
+// descriptors or calling ffi_prep_cif again
 // argFFITypes must stay alive and at a stable address for as long as cif does
-// ffi_prep_cif stores a pointer into it — which is guaranteed here since both live inside the same heap-allocated PreparedCall
+// ffi_prep_cif stores a pointer into it, which is guaranteed here since both live inside the same heap-allocated PreparedCall
 struct FFIState::PreparedCall {
     ffi_cif                cif{};
     void*                  fnptr = nullptr;
     std::vector<ffi_type*> argFFITypes;
-    std::vector<TypeInfo>  argInfo;
+    std::vector<DescRef>   argDescs;
     ffi_type*              retFFIType = nullptr;
-    TypeInfo                retInfo;
-    std::string             symName;   // for error messages
+    DescRef                retDesc;
+    std::string            symName;   // for error messages
+    std::weak_ptr<FFIState::LibHandle> lib;  // validated live at ffi_invoke() time
 };
 
-// out of line destructor
-FFIState::~FFIState() {
-    for (auto& [k, e] : libs)
-        pluginClose(e.handle);
-    for (auto& [k, e] : callbacks)
-        if (e && e->closure) ffi_closure_free(e->closure);
-    // refs and prepared calls clean up automatically via unique_ptr + map/vector destructors
-    // their ffi_type* members point at libffi's static built-in types, nothing to free
+// out of line: libs (shared_ptr<LibHandle>) and callbacks (unique_ptr<CallbackEntry>)
+// both clean up entirely on their own via their own destructors once
+// CallbackEntry is a complete type, so this has nothing left to do by hand
+FFIState::~FFIState() = default;
+
+static void trampolineBody(FFIState::CallbackEntry* entry, void* retbuf, void** argptrs)
+{
+
+    std::vector<Value> embrArgs;
+    embrArgs.reserve(entry->argDescs.size());
+    for (size_t i = 0; i < entry->argDescs.size(); ++i)
+        embrArgs.push_back(unmarshalReturn(*entry->argDescs[i].ptr, argptrs[i]));
+
+    Value result = invoke(*entry->interp, entry->embrFn, embrArgs);
+
+    // marshal the return value into retbuf.
+    const TypeDesc& retInfo = *entry->retDesc.ptr;
+    size_t rsz = descByteSize(retInfo);
+    if (rsz == 0) return;   // void
+
+    if (retInfo.kind == TypeDesc::Kind::Ptr || retInfo.kind == TypeDesc::Kind::Str) {
+        void* p = result.isPointer() ? result.asPointer().ptr : nullptr;
+        memcpy(retbuf, &p, sizeof(void*));
+        return;
+    }
+    embrtypes::FixedWidth w;
+    if (embrtypes::fixedWidth(retInfo.kind, w) && w.isFloat) {
+        if (w.size == 4) { float f = (float)result.asNumber(); memcpy(retbuf, &f, 4); }
+        else              { double f = result.asNumber();       memcpy(retbuf, &f, 8); }
+        return;
+    }
+    // integer. write into an ffi_arg slot. libffi reads the right width.
+    int64_t iv = doubleToInt64(result.asNumber(), "ffi_callback", "return value");
+    memcpy(retbuf, &iv, sizeof(iv));
 }
 
 // the actual C function pointer libffi installs
@@ -411,72 +522,31 @@ static void ffiClosureTrampoline(ffi_cif*  /*cif*/,
 {
     auto* entry = static_cast<FFIState::CallbackEntry*>(userdata);
 
-    std::vector<Value> embrArgs;
-    embrArgs.reserve(entry->argInfo.size());
-    for (size_t i = 0; i < entry->argInfo.size(); ++i)
-        embrArgs.push_back(unmarshalReturn(entry->argInfo[i], argptrs[i]));
-
-    Value result = invoke(*entry->interp, entry->embrFn, embrArgs);
-
-    // marshal the return value into retbuf.
-    size_t rsz = entry->retInfo.size;
-    if (rsz == 0)   return;   // void
-
-    bool isPtr   = entry->retInfo.isPointer;
-    bool isFloat = entry->retInfo.isFloat;
-
-    if (isPtr) {
-        void* p = result.isPointer() ? result.asPointer().ptr : nullptr;
-        memcpy(retbuf, &p, sizeof(void*));
-    } else if (isFloat && rsz == 4) {
-        float f = (float)result.asNumber(); memcpy(retbuf, &f, 4);
-    } else if (isFloat) {
-        double f = result.asNumber();       memcpy(retbuf, &f, 8);
-    } else {
-        // integer. write into an ffi_arg slot. libffi reads the right width.
-        int64_t iv = (int64_t)result.asNumber();
-        memcpy(retbuf, &iv, sizeof(iv));
+    // never let an exception cross the C frames above us; see
+    // g_pendingCallbackError. retbuf is zeroed so C sees a harmless 0/NULL.
+    try {
+        trampolineBody(entry, retbuf, argptrs);
+    } catch (...) {
+        if (!g_pendingCallbackError) g_pendingCallbackError = std::current_exception();
+        size_t rsz = std::max(descByteSize(*entry->retDesc.ptr), sizeof(ffi_arg));
+        memset(retbuf, 0, rsz);
     }
 }
-
-static PluginHandle unwrapLib(const Value&       v,
-                              const FFIState&    st,
-                              const std::string& caller)
-{
-    if (!v.isMap())
-        raiseError(caller, "expected a library handle (from ffi_open), got " + v.typeName());
-    const auto& m = v.asMap();
-    auto t = m.find("__type");
-    if (t == m.end() || t->second.asString() != "lib")
-        raiseError(caller, "expected a library handle — got a different map "
-                   "(sym handle? plain map?)");
-    uintptr_t key = (uintptr_t)m.at("__key").asNumber();
-    auto it = st.libs.find(key);
-    if (it == st.libs.end())
-        raiseError(caller, "library '" + m.at("__path").asString() +
-                   "' has already been closed");
-    return it->second.handle;
-}
-
-static void* unwrapSym(const Value& v, const std::string& caller) {
-    if (!v.isMap())
-        raiseError(caller, "expected a symbol handle (from ffi_sym), got " + v.typeName());
-    const auto& m = v.asMap();
-    auto t = m.find("__type");
-    if (t == m.end() || t->second.asString() != "sym")
-        raiseError(caller, "expected a symbol handle — got a different map "
-                   "(lib handle? plain map?)");
-    return m.at("__fnptr").asPointer().ptr;
-}
-
 
 EMBR_PLUGIN {
 
     auto ffi = std::make_shared<FFIState>();
 
-    registerTypeConstants(*interp);
+    // the closure behind every live ffi_callback is a gc root: C code keeps the function pointer until
+    // ffi_callback_free(), even if the script drops its handle, so gc_collect() must not clear the closure's
+    // captured scope (the next call from C would fail with "undefined variable")
+    // weak_ptr so this provider, stored in the Interpreter, can't keep the plugin state alive
+    interp->addGcRootProvider([weak = std::weak_ptr<FFIState>(ffi)](const TraceVisitor& visit) {
+        if (auto st = weak.lock())
+            for (auto& kv : st->callbacks) visit(kv.second->embrFn);
+    });
 
-    // ffi_open(path: str) -> map
+    // ffi_open(path: str) -> ptr<ffi.lib>
     //
     // opens a shared library via pluginOpen()
     // LoadLibraryA on windows dlopen(RTLD_NOW|RTLD_LOCAL) on POSIX
@@ -489,83 +559,76 @@ EMBR_PLUGIN {
         if (!handle)
             raiseError("ffi_open", "cannot open '" + path + "': " + pluginError());
 
-        uintptr_t key = reinterpret_cast<uintptr_t>(handle);
-        ffi->libs[key] = { handle, path };
+        auto lib = std::make_shared<FFIState::LibHandle>();
+        lib->handle = handle;
+        lib->path   = path;
+        const void* key = lib.get();
+        ffi->libs[key] = lib;
 
-        Value::map_type m;
-        m["__type"] = Value(std::string("lib"));
-        m["__key"]  = Value((double)key);
-        m["__path"] = Value(path);
-        return Value(std::move(m));
+        return Value::makePointer(const_cast<void*>(key), "ffi.lib");
     });
 
-    // ffi_close(lib: map)
-    //
-    // explicitly closes a library
-    // sym handles derived from it become dangling
-    // the caller must not use them afterwards
-    // libraries not explicitly closed are closed in ~FFIState
-    interp->bindSig("ffi_close", {pMap("lib")},
+    // ffi_close(lib: ptr<ffi.lib>)
+    // closes a library explicitly. sym/prepared handles made from it notice (their weak reference to the LibHandle
+    // expires) and raise a clean error instead of using a dangling function pointer. libraries not closed
+    // explicitly are closed in ~FFIState
+    interp->bindSig("ffi_close", {pPtr("lib")},
     [ffi](const std::vector<Value>& args) -> Value {
-        const auto& m = args[0].asMap();
-        if (!m.count("__type") || m.at("__type").asString() != "lib")
-            raiseError("ffi_close", "argument must be a library handle (from ffi_open)");
-        uintptr_t key = (uintptr_t)m.at("__key").asNumber();
-        auto it = ffi->libs.find(key);
-        if (it == ffi->libs.end())
-            raiseError("ffi_close", "library '" + m.at("__path").asString() +
-                       "' is not open (already closed?)");
-        pluginClose(it->second.handle);
-        ffi->libs.erase(it);
+        const void* key = args[0].asPointer("ffi.lib").ptr;
+        if (!ffi->libs.erase(key))
+            raiseError("ffi_close", "library is not open (already closed?)");
         return Value(0.0);
     });
 
-    // ffi_sym(lib: map, name: str) -> map
+    // ffi_sym(lib: ptr<ffi.lib>, name: str) -> ptr<ffi.sym>
     //
     // looks up a symbol via pluginSym()
     // GetProcAddress on windows dlsym on POSIX
-    interp->bindSig("ffi_sym", {pMap("lib"), pStr("name")},
+    interp->bindSig("ffi_sym", {pPtr("lib"), pStr("name")},
     [ffi](const std::vector<Value>& args) -> Value {
-        PluginHandle handle = unwrapLib(args[0], *ffi, "ffi_sym");
-        const std::string& name = args[1].asString();
-        const std::string& path = args[0].asMap().at("__path").asString();
+        const void* key = args[0].asPointer("ffi.lib").ptr;
+        auto it = ffi->libs.find(key);
+        if (it == ffi->libs.end())
+            raiseError("ffi_sym", "library has already been closed");
+        auto& lib = it->second;
 
+        const std::string& name = args[1].asString();
         void* sym = nullptr;
 
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
         dlerror();  // clear any previous error
-        sym = pluginSym(handle, name.c_str());
+        sym = pluginSym(lib->handle, name.c_str());
         const char* err = dlerror();
         if (err)
             raiseError("ffi_sym", "symbol '" + name + "' not found in '" +
-                       path + "': " + err);
+                       lib->path + "': " + err);
 #else
-        sym = pluginSym(handle, name.c_str());
+        sym = pluginSym(lib->handle, name.c_str());
         if (!sym)
             raiseError("ffi_sym", "symbol '" + name + "' not found in '" +
-                       path + "': " + pluginError());
+                       lib->path + "': " + pluginError());
 #endif
 
-        Value::map_type m;
-        m["__type"]  = Value(std::string("sym"));
-        m["__name"]  = Value(name);
-        m["__lib"]   = Value(path);
-        m["__fnptr"] = Value::makePointer(sym);
-        return Value(std::move(m));
+        if (!sym)
+            raiseError("ffi_sym", "symbol '" + name + "' resolved to a null address in '" + lib->path + "'");
+
+        return Value::makeUserdata<FFIState::SymHandle>("ffi.sym",
+            FFIState::SymHandle{sym, name, lib});
     });
 
-    // ffi_call(sym: map, ret: map, arg_types: arr, args: arr) -> any
+    // ffi_call(sym: ptr<ffi.sym>, ret: desc|nil, arg_types: arr of desc, args: arr) -> any
     //
     // marshals args, builds a libffi CIF, calls the function, and unmarshals the return value
-    // this rebuilds the cif and re-resolves every type descriptor on EVERY call. that is fine for one-off calls, wasteful in a loop
+    // this rebuilds the cif and re-resolves every type descriptor on every call. that is fine for one-off calls, wasteful in a loop
     // for repeated calls to the same symbol use ffi_prepare()/ffi_invoke() instead, which does this work once
-    // a ref map may appear in args wherever a pointer type descriptor is given
-    // its buffer address is passed as the out-parameter
+    // pass nil for ret when the function returns nothing
+    // a buffer (from embrtypes' buffer()) may appear in args wherever a ptr type descriptor is given, to use it as an out-parameter
     interp->bindSig("ffi_call",
-        {pMap("sym"), pMap("ret"), pArr("arg_types"), pArr("args")},
+        {pPtr("sym"), pAny("ret"), pArr("arg_types"), pArr("args")},
     [ffi](const std::vector<Value>& args) -> Value {
-        void* fnptr = unwrapSym(args[0], "ffi_call");
-        requireTypeDesc(args[1], "ffi_call", "ret");
+        auto* sym = args[0].userdata<FFIState::SymHandle>("ffi.sym");
+        if (sym->lib.expired())
+            raiseError("ffi_call", "the symbol's library has been closed");
 
         const auto& argTypeVals = args[2].asArray();
         const auto& argVals     = args[3].asArray();
@@ -578,16 +641,15 @@ EMBR_PLUGIN {
         size_t nargs = argTypeVals.size();
 
         // resolve descriptors + build the libffi type array
-        std::vector<TypeInfo>  argInfo(nargs);
-        std::vector<ffi_type*> ffiArgTypes(nargs);
+        std::vector<const TypeDesc*> argInfo(nargs);
+        std::vector<ffi_type*>       ffiArgTypes(nargs);
         for (size_t i = 0; i < nargs; ++i) {
-            requireTypeDesc(argTypeVals[i], "ffi_call",
-                            "arg_types[" + std::to_string(i) + "]");
-            argInfo[i]     = resolveTypeInfo(argTypeVals[i].asMap());
-            ffiArgTypes[i] = descToFFIType(argInfo[i]);
+            argInfo[i]     = embrtypes::requireDesc(argTypeVals[i], "ffi_call",
+                                                    "arg_types[" + std::to_string(i) + "]");
+            ffiArgTypes[i] = descToFFIType(*argInfo[i]);
         }
-        TypeInfo  retInfo = resolveTypeInfo(args[1].asMap());
-        ffi_type* ffiRet  = descToFFIType(retInfo);
+        const TypeDesc* retInfo = resolveDescArg(args[1], "ffi_call", "ret").ptr;
+        ffi_type* ffiRet = descToFFIType(*retInfo);
 
         // prepare the call interface
         // this plus the descriptor resolution above is exactly the per-call cost ffi_prepare/ffi_invoke avoid
@@ -603,37 +665,39 @@ EMBR_PLUGIN {
             raiseError("ffi_call", "ffi_prep_cif failed (status=" +
                        std::to_string((int)status) + ")");
 
-        return performCall("ffi_call", cif, fnptr, argInfo, retInfo, argVals, *ffi);
+        return performCall("ffi_call", cif, sym->fnptr, argInfo, *retInfo, argVals);
     });
 
-    // ffi_prepare(sym: map, ret: map, arg_types: arr) -> map
+    // ffi_prepare(sym: ptr<ffi.sym>, ret: desc|nil, arg_types: arr of desc) -> ptr<ffi.prepared>
     //
-    // resolves the return + argument type descriptors and calls ffi_prep_cif ONCE, caching the resulting cif and the resolved TypeInfo array in FFIState behind an opaque handle
+    // resolves the return + argument type descriptors and calls ffi_prep_cif once, caching the resulting cif behind a refcounted handle
     // pass that handle to ffi_invoke() to run the call without repeating any of this setup
-    // use this instead of ffi_call() whenever the same symbol is invoked repeatedly since ffi_call() redoes the descriptor resolution and ffi_prep_cif on every single invocation
+    // use this instead of ffi_call() whenever the same symbol is called repeatedly, because ffi_call() redoes the
+    // descriptor resolution and ffi_prep_cif on every call
     interp->bindSig("ffi_prepare",
-        {pMap("sym"), pMap("ret"), pArr("arg_types")},
+        {pPtr("sym"), pAny("ret"), pArr("arg_types")},
     [ffi](const std::vector<Value>& args) -> Value {
-        void* fnptr = unwrapSym(args[0], "ffi_prepare");
-        requireTypeDesc(args[1], "ffi_prepare", "ret");
+        auto* sym = args[0].userdata<FFIState::SymHandle>("ffi.sym");
+        if (sym->lib.expired())
+            raiseError("ffi_prepare", "the symbol's library has been closed");
+
+        auto prep = std::make_shared<FFIState::PreparedCall>();
+        prep->fnptr   = sym->fnptr;
+        prep->symName = sym->name;
+        prep->lib     = sym->lib;
 
         const auto& argTypeVals = args[2].asArray();
         size_t nargs = argTypeVals.size();
 
-        auto prep = std::make_unique<FFIState::PreparedCall>();
-        prep->fnptr   = fnptr;
-        prep->symName = args[0].asMap().at("__name").asString();
-
-        prep->argInfo.resize(nargs);
+        prep->argDescs.resize(nargs);
         prep->argFFITypes.resize(nargs);
         for (size_t i = 0; i < nargs; ++i) {
-            requireTypeDesc(argTypeVals[i], "ffi_prepare",
-                            "arg_types[" + std::to_string(i) + "]");
-            prep->argInfo[i]     = resolveTypeInfo(argTypeVals[i].asMap());
-            prep->argFFITypes[i] = descToFFIType(prep->argInfo[i]);
+            prep->argDescs[i]     = resolveDescArg(argTypeVals[i], "ffi_prepare",
+                                                   "arg_types[" + std::to_string(i) + "]");
+            prep->argFFITypes[i] = descToFFIType(*prep->argDescs[i].ptr);
         }
-        prep->retInfo    = resolveTypeInfo(args[1].asMap());
-        prep->retFFIType = descToFFIType(prep->retInfo);
+        prep->retDesc    = resolveDescArg(args[1], "ffi_prepare", "ret");
+        prep->retFFIType = descToFFIType(*prep->retDesc.ptr);
 
         ffi_status status = ffi_prep_cif(
             &prep->cif,
@@ -646,109 +710,29 @@ EMBR_PLUGIN {
             raiseError("ffi_prepare", "ffi_prep_cif failed (status=" +
                        std::to_string((int)status) + ")");
 
-        uint64_t key = ffi->nextPreparedKey++;
-        ffi->prepared[key] = std::move(prep);
-
-        Value::map_type m;
-        m["__type"] = Value(std::string("prepared"));
-        m["__key"]  = Value((double)key);
-        m["__sym"]  = args[0].asMap().at("__name");
-        return Value(std::move(m));
+        return Value(TypedPtr(prep.get(), "ffi.prepared", prep));
     });
 
-    // ffi_invoke(prepared: map, args: arr) -> any
+    // ffi_invoke(prepared: ptr<ffi.prepared>, args: arr) -> any
     //
     // runs a call built by ffi_prepare()
     // only marshals args and calls ffi_call() itself. no cif prep, no descriptor hash lookups
     // this is the fast path for repeated calls to the same symbol
-    interp->bindSig("ffi_invoke", {pMap("prepared"), pArr("args")},
-    [ffi](const std::vector<Value>& args) -> Value {
-        const auto& m = args[0].asMap();
-        if (!m.count("__type") || m.at("__type").asString() != "prepared")
-            raiseError("ffi_invoke", "argument must be a prepared call (from ffi_prepare)");
-        uint64_t key = (uint64_t)m.at("__key").asNumber();
-        auto it = ffi->prepared.find(key);
-        if (it == ffi->prepared.end())
-            raiseError("ffi_invoke", "prepared call '" + m.at("__sym").asString() +
-                       "' has been freed");
-        auto& prep = *it->second;
+    interp->bindSig("ffi_invoke", {pPtr("prepared"), pArr("args")},
+    [](const std::vector<Value>& args) -> Value {
+        auto* prep = args[0].userdata<FFIState::PreparedCall>("ffi.prepared");
+        if (prep->lib.expired())
+            raiseError("ffi_invoke", "prepared call '" + prep->symName +
+                       "': the symbol's library has been closed");
 
-        return performCall("ffi_invoke", prep.cif, prep.fnptr,
-                           prep.argInfo, prep.retInfo, args[1].asArray(), *ffi);
+        std::vector<const TypeDesc*> argInfo(prep->argDescs.size());
+        for (size_t i = 0; i < argInfo.size(); ++i) argInfo[i] = prep->argDescs[i].ptr;
+
+        return performCall("ffi_invoke", prep->cif, prep->fnptr,
+                           argInfo, *prep->retDesc.ptr, args[1].asArray());
     });
 
-    // ffi_prepared_free(prepared: map)
-    //
-    // releases a prepared call.
-    // does not touch the underlying symbol or library. those are independent handles and can outlive this one
-    // not required at process exit (~FFIState cleans up automatically) but useful for long-running scripts that build many prepared calls
-    interp->bindSig("ffi_prepared_free", {pMap("prepared")},
-    [ffi](const std::vector<Value>& args) -> Value {
-        const auto& m = args[0].asMap();
-        if (!m.count("__type") || m.at("__type").asString() != "prepared")
-            raiseError("ffi_prepared_free", "argument must be a prepared call (from ffi_prepare)");
-        uint64_t key = (uint64_t)m.at("__key").asNumber();
-        if (!ffi->prepared.erase(key))
-            raiseError("ffi_prepared_free", "prepared call has already been freed");
-        return Value(0.0);
-    });
-
-    // ffi_ref(desc: map) -> map
-    //
-    // allocates a zeroed buffer sized for the given C type and registers it
-    // pass the returned map to ffi_call wherever a pointer type descriptor appears to use it as an out-parameter
-    // read the written value back with ffi_deref
-    // release with ffi_ref_free when done
-    interp->bindSig("ffi_ref", {pMap("desc")},
-    [ffi](const std::vector<Value>& args) -> Value {
-        requireTypeDesc(args[0], "ffi_ref", "desc");
-        size_t sz = (size_t)args[0].asMap().at("size").asNumber();
-        if (sz == 0)
-            raiseError("ffi_ref", "cannot create a ref to void");
-
-        uint64_t key = ffi->nextRefKey++;
-        ffi->refs[key] = std::make_unique<FFIState::RefEntry>(
-            FFIState::RefEntry{ std::vector<uint8_t>(sz, 0), args[0] }
-        );
-
-        Value::map_type m;
-        m["__type"] = Value(std::string("ref"));
-        m["__key"]  = Value((double)key);
-        m["__desc"] = args[0];
-        return Value(std::move(m));
-    });
-
-    // ffi_deref(ref: map) -> any
-    //
-    // reads the current value of a ref buffer and returns it as a Value
-    interp->bindSig("ffi_deref", {pMap("ref")},
-    [ffi](const std::vector<Value>& args) -> Value {
-        const auto& m = args[0].asMap();
-        if (!m.count("__type") || m.at("__type").asString() != "ref")
-            raiseError("ffi_deref", "argument must be a ref (from ffi_ref)");
-        uint64_t key = (uint64_t)m.at("__key").asNumber();
-        auto it = ffi->refs.find(key);
-        if (it == ffi->refs.end())
-            raiseError("ffi_deref", "ref has been freed");
-        return unmarshalReturn(resolveTypeInfo(it->second->desc.asMap()), it->second->buf.data());
-    });
-
-    // ffi_ref_free(ref: map)
-    //
-    // explicitly releases a ref buffer
-    // subsequent ffi_deref or use as an ffi_call argument will raise an error
-    interp->bindSig("ffi_ref_free", {pMap("ref")},
-    [ffi](const std::vector<Value>& args) -> Value {
-        const auto& m = args[0].asMap();
-        if (!m.count("__type") || m.at("__type").asString() != "ref")
-            raiseError("ffi_ref_free", "argument must be a ref (from ffi_ref)");
-        uint64_t key = (uint64_t)m.at("__key").asNumber();
-        if (!ffi->refs.erase(key))
-            raiseError("ffi_ref_free", "ref has already been freed");
-        return Value(0.0);
-    });
-
-    // ffi_callback(fn: fn, ret: map, arg_types: arr) -> map
+    // ffi_callback(fn: fn, ret: desc|nil, arg_types: arr of desc) -> ptr<ffi.callback>
     //
     // synthesises a real C function pointer that when called by C code invokes fn with arguments unmarshalled from C
     //
@@ -757,34 +741,30 @@ EMBR_PLUGIN {
     // ffi_closure_alloc     returns a writable address for setup
     // ffi_prep_closure_loc  fills in an executable address for passing to C
     //
-    // the closure entry is owned by FFIState::callbacks as a unique_ptr so its is stable for the trampoline's userdata pointer even if the map rehashes
+    // the closure entry is owned by FFIState::callbacks as a unique_ptr, keyed
+    // by the executable address itself, the same address the returned
+    // Value wraps and that C code will call through
     // release with ffi_callback_free when the C library no longer holds the pointer
     interp->bindSig("ffi_callback",
-        {pFn("fn"), pMap("ret"), pArr("arg_types")},
+        {pFn("fn"), pAny("ret"), pArr("arg_types")},
     [ffi, interp](const std::vector<Value>& args) -> Value {
-        requireTypeDesc(args[1], "ffi_callback", "ret");
-
         const auto& argTypeVals = args[2].asArray();
         size_t nargs = argTypeVals.size();
-        for (size_t i = 0; i < nargs; ++i)
-            requireTypeDesc(argTypeVals[i], "ffi_callback",
-                            "arg_types[" + std::to_string(i) + "]");
 
-        uint64_t key   = ffi->nextCallbackKey++;
-        auto     entry = std::make_unique<FFIState::CallbackEntry>();
-
+        auto entry = std::make_unique<FFIState::CallbackEntry>();
         entry->embrFn  = args[0];
-        entry->retInfo = resolveTypeInfo(args[1].asMap());
+        entry->retDesc = resolveDescArg(args[1], "ffi_callback", "ret");
         entry->interp  = interp;
-        entry->argInfo.resize(nargs);
+        entry->argDescs.resize(nargs);
         entry->argFFITypes.resize(nargs);
 
         for (size_t i = 0; i < nargs; ++i) {
-            entry->argInfo[i]     = resolveTypeInfo(argTypeVals[i].asMap());
-            entry->argFFITypes[i] = descToFFIType(entry->argInfo[i]);
+            entry->argDescs[i]     = resolveDescArg(argTypeVals[i], "ffi_callback",
+                                                    "arg_types[" + std::to_string(i) + "]");
+            entry->argFFITypes[i] = descToFFIType(*entry->argDescs[i].ptr);
         }
 
-        ffi_type* retType = descToFFIType(entry->retInfo);
+        ffi_type* retType = descToFFIType(*entry->retDesc.ptr);
 
         // allocate writable page. execPtr is the matching executable address
         void* execPtr = nullptr;
@@ -803,6 +783,7 @@ EMBR_PLUGIN {
         );
         if (s != FFI_OK) {
             ffi_closure_free(entry->closure);
+            entry->closure = nullptr;
             raiseError("ffi_callback",
                 "ffi_prep_cif failed for callback (status=" + std::to_string((int)s) + ")");
         }
@@ -817,39 +798,31 @@ EMBR_PLUGIN {
         );
         if (s != FFI_OK) {
             ffi_closure_free(entry->closure);
+            entry->closure = nullptr;
             raiseError("ffi_callback",
                 "ffi_prep_closure_loc failed (status=" + std::to_string((int)s) + ")");
         }
 
         entry->fnptr = execPtr;
 
-        // transfer ownership before building the return map so that any exception during map construction still runs the destructor
-        FFIState::CallbackEntry* raw = entry.get();
+        // key by the executable address itself: that's what the returned
+        // Value wraps (it must, so it can flow straight into a ptr-typed
+        // ffi_call argument) and so what ffi_callback_free must look up by
+        const void* key = execPtr;
         ffi->callbacks[key] = std::move(entry);
 
-        Value::map_type m;
-        m["__type"]  = Value(std::string("callback"));
-        m["__key"]   = Value((double)key);
-        m["__fnptr"] = Value::makePointer(raw->fnptr);  // pass this to C
-        return Value(std::move(m));
+        return Value::makePointer(execPtr, "ffi.callback");
     });
 
-    // ffi_callback_free(cb: map)
+    // ffi_callback_free(cb: ptr<ffi.callback>)
     //
     // releases the executable page and the embr function reference
     // must be called once C code no longer holds the function pointer
-    interp->bindSig("ffi_callback_free", {pMap("cb")},
+    interp->bindSig("ffi_callback_free", {pPtr("cb")},
     [ffi](const std::vector<Value>& args) -> Value {
-        const auto& m = args[0].asMap();
-        if (!m.count("__type") || m.at("__type").asString() != "callback")
-            raiseError("ffi_callback_free", "argument must be a callback (from ffi_callback)");
-        uint64_t key = (uint64_t)m.at("__key").asNumber();
-        auto it = ffi->callbacks.find(key);
-        if (it == ffi->callbacks.end())
+        const void* key = args[0].asPointer("ffi.callback").ptr;
+        if (!ffi->callbacks.erase(key))
             raiseError("ffi_callback_free", "callback has already been freed");
-        ffi_closure_free(it->second->closure);
-        it->second->closure = nullptr;  // prevent double-free in ~FFIState
-        ffi->callbacks.erase(it);       // unique_ptr destructs embrFn released
         return Value(0.0);
     });
 
@@ -868,62 +841,121 @@ EMBR_PLUGIN {
     // used to access struct fields by known offset or to step through arrays of C structs
     interp->bindSig("ptr_offset", {pPtr("p"), pOpt("n")},
     [](const std::vector<Value>& args) -> Value {
-        ptrdiff_t off = args.size() > 1 ? (ptrdiff_t)args[1].asNumber() : 0;
+        ptrdiff_t off = args.size() > 1 ? (ptrdiff_t)doubleToInt64(args[1].asNumber(), "ptr_offset", "n") : 0;
         uint8_t* base = static_cast<uint8_t*>(args[0].asPointer().ptr);
         return Value::makePointer(base + off);
     });
 
-    // ptr_read(p, desc: map) -> any
-    //
-    // reads a value from raw memory at p, interpreting it according to desc
-    // combine with ptr_offset to walk struct fields
-    interp->bindSig("ptr_read", {pPtr("p"), pMap("desc")},
+    // ptr_read(p, desc) -> any
+    // reads a value from raw memory at p, interpreted per desc (an embrtypes descriptor). use ptr_offset to walk
+    // struct fields, or pass a struct_type() desc directly
+    interp->bindSig("ptr_read", {pPtr("p"), pAny("desc")},
     [](const std::vector<Value>& args) -> Value {
-        requireTypeDesc(args[1], "ptr_read", "desc");
+        const TypeDesc* d = embrtypes::requireDesc(args[1], "ptr_read", "desc");
         void* p = args[0].asPointer().ptr;
         if (!p) raiseError("ptr_read", "cannot read from null pointer");
-        return unmarshalReturn(resolveTypeInfo(args[1].asMap()), p);
+        return unmarshalReturn(*d, p);
     });
 
-    // ptr_write(p, desc: map, val: any)
-    //
-    // writes val into raw memory at p according to desc
-    interp->bindSig("ptr_write", {pPtr("p"), pMap("desc"), pAny("val")},
+    // ptr_write(p, desc, val: any)
+    // writes val into raw memory at p per desc. for a struct_type(), val must be a map keyed by field name, and
+    // every field is written to its computed offset, nested structs included
+    interp->bindSig("ptr_write", {pPtr("p"), pAny("desc"), pAny("val")},
     [](const std::vector<Value>& args) -> Value {
-        requireTypeDesc(args[1], "ptr_write", "desc");
+        const TypeDesc* d = embrtypes::requireDesc(args[1], "ptr_write", "desc");
         void* p = args[0].asPointer().ptr;
         if (!p) raiseError("ptr_write", "cannot write to null pointer");
-
-        const auto& desc = args[1].asMap();
-        size_t sz      = (size_t)desc.at("size").asNumber();
-        bool isFloat   = desc.at("float"  ).truthy();
-        bool isPtr     = desc.at("pointer").truthy();
-        const Value& v = args[2];
-
-        if (isPtr) {
-            if (!v.isPointer())
-                raiseError("ptr_write", "value must be a pointer for ptr type");
-            void* q = v.asPointer().ptr;
-            memcpy(p, &q, sizeof(void*));
-        } else if (isFloat) {
-            if (!v.isNumeric())
-                raiseError("ptr_write", "value must be a number for float type");
-            double d = v.asNumber();
-            if (sz == 4) { float f = (float)d; memcpy(p, &f, 4); }
-            else          {                      memcpy(p, &d, 8); }
-        } else {
-            if (!v.isNumeric())
-                raiseError("ptr_write", "value must be a number for integer type");
-            int64_t iv = v.isInt() ? v.asInt() : (int64_t)v.asNumber();
-            switch (sz) {
-                case 1: { uint8_t  x=(uint8_t) iv; memcpy(p,&x,1); } break;
-                case 2: { uint16_t x=(uint16_t)iv; memcpy(p,&x,2); } break;
-                case 4: { uint32_t x=(uint32_t)iv; memcpy(p,&x,4); } break;
-                case 8: { uint64_t x=(uint64_t)iv; memcpy(p,&x,8); } break;
-                default: raiseError("ptr_write", "unsupported integer size " +
-                                    std::to_string(sz));
-            }
-        }
+        writeValueToMemory("ptr_write", p, *d, args[2]);
         return Value(0.0);
+    });
+
+    // ffi_call_var(sym: ptr<ffi.sym>, ret: desc|nil, arg_types: arr of desc, args: arr, nfixed: num) -> any
+    // like ffi_call, for variadic C functions (printf-style). nfixed is how many of arg_types/args are the declared
+    // fixed parameters (1 for printf's format string), the rest are the variadic tail. it uses ffi_prep_cif_var, which
+    // libffi needs for ABI-correct variadic calls (x86-64 SysV must set %al to the number of vector registers used)
+    interp->bindSig("ffi_call_var",
+        {pPtr("sym"), pAny("ret"), pArr("arg_types"), pArr("args"), pNum("nfixed")},
+    [](const std::vector<Value>& args) -> Value {
+        auto* sym = args[0].userdata<FFIState::SymHandle>("ffi.sym");
+        if (sym->lib.expired())
+            raiseError("ffi_call_var", "the symbol's library has been closed");
+
+        const auto& argTypeVals = args[2].asArray();
+        const auto& argVals     = args[3].asArray();
+        if (argTypeVals.size() != argVals.size())
+            raiseError("ffi_call_var",
+                "arg_types has " + std::to_string(argTypeVals.size()) +
+                " entries but args has " + std::to_string(argVals.size()));
+
+        size_t nargs  = argTypeVals.size();
+        size_t nfixed = (size_t)nfixedArg(args[4], "ffi_call_var");
+        if (nfixed > nargs)
+            raiseError("ffi_call_var", "nfixed (" + std::to_string(nfixed) +
+                       ") cannot exceed the total argument count (" + std::to_string(nargs) + ")");
+
+        std::vector<const TypeDesc*> argInfo(nargs);
+        std::vector<ffi_type*>       ffiArgTypes(nargs);
+        for (size_t i = 0; i < nargs; ++i) {
+            argInfo[i]     = embrtypes::requireDesc(argTypeVals[i], "ffi_call_var",
+                                                    "arg_types[" + std::to_string(i) + "]");
+            ffiArgTypes[i] = descToFFIType(*argInfo[i]);
+        }
+        const TypeDesc* retInfo = resolveDescArg(args[1], "ffi_call_var", "ret").ptr;
+        ffi_type* ffiRet = descToFFIType(*retInfo);
+
+        ffi_cif cif;
+        ffi_status status = ffi_prep_cif_var(
+            &cif, FFI_DEFAULT_ABI, (unsigned int)nfixed, (unsigned int)nargs, ffiRet,
+            nargs > 0 ? ffiArgTypes.data() : nullptr
+        );
+        if (status != FFI_OK)
+            raiseError("ffi_call_var", "ffi_prep_cif_var failed (status=" +
+                       std::to_string((int)status) + ")");
+
+        return performCall("ffi_call_var", cif, sym->fnptr, argInfo, *retInfo, argVals);
+    });
+
+    // ffi_prepare_var(sym: ptr<ffi.sym>, ret: desc|nil, arg_types: arr of desc, nfixed: num) -> ptr<ffi.prepared>
+    // like ffi_prepare for variadic functions (see ffi_call_var for nfixed). libffi bakes the total argument count
+    // into the cif, so a prepared variadic call only works with ffi_invoke() calls of exactly that many arguments.
+    // a different count needs its own ffi_prepare_var/ffi_call_var
+    interp->bindSig("ffi_prepare_var",
+        {pPtr("sym"), pAny("ret"), pArr("arg_types"), pNum("nfixed")},
+    [](const std::vector<Value>& args) -> Value {
+        auto* sym = args[0].userdata<FFIState::SymHandle>("ffi.sym");
+        if (sym->lib.expired())
+            raiseError("ffi_prepare_var", "the symbol's library has been closed");
+
+        const auto& argTypeVals = args[2].asArray();
+        size_t nargs  = argTypeVals.size();
+        size_t nfixed = (size_t)nfixedArg(args[3], "ffi_prepare_var");
+        if (nfixed > nargs)
+            raiseError("ffi_prepare_var", "nfixed (" + std::to_string(nfixed) +
+                       ") cannot exceed the total argument count (" + std::to_string(nargs) + ")");
+
+        auto prep = std::make_shared<FFIState::PreparedCall>();
+        prep->fnptr   = sym->fnptr;
+        prep->symName = sym->name;
+        prep->lib     = sym->lib;
+
+        prep->argDescs.resize(nargs);
+        prep->argFFITypes.resize(nargs);
+        for (size_t i = 0; i < nargs; ++i) {
+            prep->argDescs[i]     = resolveDescArg(argTypeVals[i], "ffi_prepare_var",
+                                                   "arg_types[" + std::to_string(i) + "]");
+            prep->argFFITypes[i] = descToFFIType(*prep->argDescs[i].ptr);
+        }
+        prep->retDesc    = resolveDescArg(args[1], "ffi_prepare_var", "ret");
+        prep->retFFIType = descToFFIType(*prep->retDesc.ptr);
+
+        ffi_status status = ffi_prep_cif_var(
+            &prep->cif, FFI_DEFAULT_ABI, (unsigned int)nfixed, (unsigned int)nargs,
+            prep->retFFIType, nargs > 0 ? prep->argFFITypes.data() : nullptr
+        );
+        if (status != FFI_OK)
+            raiseError("ffi_prepare_var", "ffi_prep_cif_var failed (status=" +
+                       std::to_string((int)status) + ")");
+
+        return Value(TypedPtr(prep.get(), "ffi.prepared", prep));
     });
 }

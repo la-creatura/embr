@@ -1,0 +1,29 @@
+# working with arrays and maps using the embrlib helpers
+import "embrlib"
+
+nums = [5, 2, 9, 1, 7]
+print(sort(nums))
+print(sort(nums, 1))
+print(sum(nums))
+print(min(nums))
+print(max(nums))
+
+words = ["pear", "fig", "banana", "kiwi"]
+# sort_cmp: stable, comparator returns <0, 0 or >0
+print(sort_cmp(words, fn(a, b) return len(a) - len(b) end))
+
+print(filter(nums, fn(x) return x > 4 end))
+print(reduce(nums, fn(acc, x) return acc + x * x end, 0))
+print(for_each_do(words, fn(w) return len(w) end))
+
+print(zip(["a", "b", "c"], [1, 2, 3]))
+print(enumerate(["x", "y"], 1))
+print(concat([1, 2], [3], [4, 5]))
+print(slice(words, 1, 3))
+print(join(words, ", "))
+
+ages = {"carol": 31, "alice": 30, "bob": 25}
+print(keys(ages))
+print(items(ages))
+print(map_pick(ages, ["bob", "carol"]))
+print(has(ages, "alice"))

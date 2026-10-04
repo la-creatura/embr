@@ -1,0 +1,404 @@
+# pkg.embr -- a small package manager for embr, written in embr on top of plugins/http, fs, json, embrlib and str
+# (same idea as modules/ffi.embr: a real feature built in embr itself instead of a native plugin). the CLI reaches
+# it through `embr pkg ...` (see src/cli.cpp)
+#
+# usage (as a library)
+#   import "pkg.embr"
+#   pkg_configure({"registry_url": "http://localhost:8931"})
+#   pkg_install("foo")                 # installs the "latest" version
+#   pkg_install("foo", "1.0.0")        # installs an exact version
+#   print(pkg_list())                  # installed name -> {version, type, ...}
+#   pkg_remove("foo")
+#
+# usage (from the CLI, once wired into cli.cpp)
+#   embr pkg --registry http://localhost:8931 install foo
+#   embr pkg --registry http://localhost:8931 install foo 1.0.0
+#   embr pkg list
+#   embr pkg remove foo
+#
+# registry protocol
+#   a registry is anything that serves GET <registry_url>/index.json, a JSON document like:
+#     {
+#       "<package name>": {
+#         "latest": "2.0.0",
+#         "versions": {
+#           "1.0.0": {"url": "/artifacts/foo-1.0.0.embr", "sha256": "...", "type": "embr"},
+#           "2.0.0": {"url": "/artifacts/foo-2.0.0.so",    "sha256": "...", "type": "plugin"}
+#         }
+#       },
+#       ...
+#     }
+#   - "url" is resolved against registry_url unless it already starts with http:// or https://. so a registry can
+#     host artifacts itself at a relative path, or point at a real git host's release download url
+#     ("https://github.com/<owner>/<repo>/releases/download/<tag>/<asset>", or a source snapshot like
+#     ".../archive/refs/tags/<tag>.tar.gz"). https works because the http plugin is built with TLS by default
+#   - "type" says where an installed artifact goes: "embr" (a script module) -> ./modules/, "plugin" (a native
+#     .so/.dll) -> ./plugins/. those are where `import` already looks (fileCandidates in core/module.h), so a package
+#     of either kind can be imported right after install. anything else ("asset": a release tarball, a vendored C
+#     header, ...) goes to ./vendor/
+#   - "sha256" is optional. if present, a download that doesn't match is rejected (not installed, not cached)
+#
+# caching and re-installs
+#   every successful download is written to the cache_dir in __pkg_config as "<name>-<version>" before it is copied
+#   into plugins/ or modules/. pkg_install() checks the cache first and only downloads again if the cached file is
+#   missing or (when a sha256 is published) no longer matches. each version has its own cache entry, so switching a
+#   project between two already-downloaded versions needs no network at all
+#
+# the double-underscore helpers below are plain top-level bindings, not `local`: __pkg_config is one shared mutable
+# registry that several exported functions read and write (see the note in modules/ffi.embr)
+
+import "http"
+import "json"
+import "fs"
+import "str"
+import "embrlib"
+
+__pkg_config = {
+    "registry_url": "",
+    "cache_dir": "pkg_cache",
+    "plugins_dir": "plugins",
+    "modules_dir": "modules",
+    "vendor_dir": "vendor",
+    "manifest_path": "pkg_installed.json",
+}
+
+# pkg_configure(opts: map) -> 0
+# merges opts into the module's config. keys: registry_url, cache_dir, plugins_dir, modules_dir, vendor_dir,
+# manifest_path. see the __pkg_config initializer above for the defaults, and the header for what registry_url must serve
+fn pkg_configure(opts)
+    __pkg_config = map_merge(__pkg_config, opts)
+    return 0
+end
+
+fn __pkg_require_registry()
+    if __pkg_config["registry_url"] == ""
+        error("pkg: no registry configured -- call pkg_configure({\"registry_url\": \"http://host:port\"}) first")
+    end
+end
+
+# resolves a possibly-relative artifact URL against registry_url.
+fn __pkg_resolve_url(url)
+    if str_startswith(url, "http://") or str_startswith(url, "https://")
+        return url
+    end
+    base = __pkg_config["registry_url"]
+    if str_endswith(base, "/")
+        base = slice(base, 0, len(base) - 1)
+    end
+    if !str_startswith(url, "/")
+        url = "/" + url
+    end
+    return base + url
+end
+
+# pkg_fetch_index() -> map  (the registry's parsed index.json)
+fn pkg_fetch_index()
+    __pkg_require_registry()
+    r = http_get(__pkg_resolve_url("/index.json"))
+    if r["ok"] != 1
+        error("pkg: failed to fetch registry index (status " + str(r["status"]) + ")")
+    end
+    return json_parse(r["body"])
+end
+
+# [major, minor, patch] from a "X.Y.Z" (or "X.Y"/"X") version string; any
+# missing or non-numeric component reads as 0, so comparisons never raise on
+# a loosely-formed version, they just treat it as sorting low.
+fn __pkg_semver_parts(v)
+    parts = str_split(v, ".")
+    out = [0, 0, 0]
+    i = 0
+    while i < len(parts) and i < 3
+        p = parts[i]
+        if str_isdigit(p)
+            out[i] = num(p)
+        end
+        i = i + 1
+    end
+    return out
+end
+
+# -1/0/1 comparator, ascending
+fn __pkg_semver_cmp(a, b)
+    pa = __pkg_semver_parts(a)
+    pb = __pkg_semver_parts(b)
+    i = 0
+    while i < 3
+        if pa[i] < pb[i]
+            return -1
+        end
+        if pa[i] > pb[i]
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# pkg_versions(index: map, name: str) -> arr of version strings, ascending semver order
+fn pkg_versions(index, name)
+    if !has(index, name)
+        error("pkg: unknown package '" + name + "'")
+    end
+    vs = keys(index[name]["versions"])
+    return sort_do(vs, fn(v) return __pkg_semver_parts(v)[0] * 1000000 + __pkg_semver_parts(v)[1] * 1000 + __pkg_semver_parts(v)[2] end)
+end
+
+# pkg_resolve(index: map, name: str, spec?: str) -> version string
+# spec is an exact version ("1.0.0"), "latest" or omitted (the registry's own "latest" if it has one, else the
+# highest semver), or a ">=X.Y.Z" lower bound (the lowest version that satisfies it, so the result is the same
+# for the same index instead of drifting to whatever's newest)
+fn pkg_resolve(index, name, spec)
+    if !has(index, name)
+        error("pkg: unknown package '" + name + "'")
+    end
+    entry = index[name]
+    versions = pkg_versions(index, name)
+
+    if spec == "" or spec == "latest"
+        if has(entry, "latest") and has(entry["versions"], entry["latest"])
+            return entry["latest"]
+        end
+        return versions[len(versions) - 1]
+    end
+
+    if str_startswith(spec, ">=")
+        floor = str_strip(slice(spec, 2, len(spec)))
+        for v in versions
+            if __pkg_semver_cmp(v, floor) >= 0
+                return v
+            end
+        end
+        error("pkg: no version of '" + name + "' satisfies " + spec)
+    end
+
+    if has(entry["versions"], spec)
+        return spec
+    end
+    error("pkg: '" + name + "' has no version '" + spec + "' (available: " + join(versions, ", ") + ")")
+end
+
+# extension of url. a few double extensions (.tar.gz and friends) count as one, unlike fs_extname(), which takes
+# everything after the last dot (that would turn ".../v1.0.0.tar.gz" into ".gz" and mangle the cached filename)
+# checked case-insensitively, since urls vary in case but the format doesn't
+__pkg_double_exts = [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst"]
+
+fn __pkg_extname(url)
+    lower = str_lower(url)
+    for suf in __pkg_double_exts
+        if str_endswith(lower, suf)
+            return slice(url, len(url) - len(suf), len(url))
+        end
+    end
+    return fs_extname(url)
+end
+
+fn __pkg_cache_file(name, version, url)
+    ext = __pkg_extname(url)
+    return fs_join(__pkg_config["cache_dir"], name + "-" + version + ext)
+end
+
+fn __pkg_install_dir(kind)
+    if kind == "plugin"
+        return __pkg_config["plugins_dir"]
+    end
+    if kind == "embr"
+        return __pkg_config["modules_dir"]
+    end
+    return __pkg_config["vendor_dir"]
+end
+
+fn __pkg_install_file(name, kind, ext)
+    return fs_join(__pkg_install_dir(kind), name + ext)
+end
+
+# downloads (or reuses a cached copy of) name@version's artifact, verifying
+# its sha256 when the registry entry published one. returns the local cache
+# path. raises on a checksum mismatch (cached or freshly downloaded) rather
+# than silently installing untrusted content.
+fn pkg_download(name, version, versionEntry)
+    fs_mkdir(__pkg_config["cache_dir"], 1)
+    cachePath = __pkg_cache_file(name, version, versionEntry["url"])
+    wantSha = ""
+    if has(versionEntry, "sha256")
+        wantSha = versionEntry["sha256"]
+    end
+
+    if fs_exists(cachePath)
+        if wantSha == "" or http_sha256(load_file(cachePath)) == wantSha
+            return cachePath
+        end
+        # stale/corrupt cache entry, fall through and re-download
+    end
+
+    url = __pkg_resolve_url(versionEntry["url"])
+    r = http_download(url, cachePath)
+    if r["ok"] != 1
+        fs_remove(cachePath)
+        error("pkg: download failed for " + name + "@" + version + " (status " + str(r["status"]) + ")")
+    end
+
+    if wantSha != ""
+        gotSha = http_sha256(load_file(cachePath))
+        if gotSha != wantSha
+            fs_remove(cachePath)
+            error("pkg: checksum mismatch for " + name + "@" + version + " (expected " + wantSha + ", got " + gotSha + ")")
+        end
+    end
+    return cachePath
+end
+
+fn pkg_load_manifest()
+    path = __pkg_config["manifest_path"]
+    if !fs_exists(path)
+        return {}
+    end
+    return json_parse(load_file(path))
+end
+
+fn pkg_save_manifest(m)
+    write_file(__pkg_config["manifest_path"], json_stringify(m, 2))
+    return 0
+end
+
+# pkg_install(name: str, spec?: str) -> map {name, version, type, path}
+# resolves spec against the registry index, downloads or reuses the cached artifact, copies it into plugins/ or
+# modules/ (per its "type"), and records it in the manifest. running it again with the same (name, spec) is cheap:
+# the cache check in pkg_download() skips the network when a valid copy already exists
+fn pkg_install(name, spec)
+    index = pkg_fetch_index()
+    version = pkg_resolve(index, name, spec)
+    versionEntry = index[name]["versions"][version]
+    kind = "embr"
+    if has(versionEntry, "type")
+        kind = versionEntry["type"]
+    end
+
+    cachePath = pkg_download(name, version, versionEntry)
+
+    ext = __pkg_extname(versionEntry["url"])
+    destPath = __pkg_install_file(name, kind, ext)
+    fs_mkdir(__pkg_install_dir(kind), 1)
+    write_file(destPath, load_file(cachePath))
+
+    manifest = pkg_load_manifest()
+    manifest[name] = {"version": version, "type": kind, "path": destPath}
+    pkg_save_manifest(manifest)
+
+    return manifest[name]
+end
+
+# pkg_list() -> map (the installed-package manifest: name -> {version, type, path})
+fn pkg_list()
+    return pkg_load_manifest()
+end
+
+# pkg_remove(name: str) -> 0
+# removes the installed artifact (if its recorded path still exists) and drops it from the manifest. the cache is
+# untouched, so installing the same version again needs no network
+fn pkg_remove(name)
+    manifest = pkg_load_manifest()
+    if !has(manifest, name)
+        error("pkg: '" + name + "' is not installed")
+    end
+    path = manifest[name]["path"]
+    if fs_exists(path)
+        fs_remove(path)
+    end
+    manifest = map_omit(manifest, [name])
+    pkg_save_manifest(manifest)
+    return 0
+end
+
+# ---------------------------------------------------------------------------
+# CLI entry point, see src/cli.cpp's "pkg" subcommand, which builds an
+# argv array from the process's own argv and calls this.
+# ---------------------------------------------------------------------------
+
+fn __pkg_usage()
+    print("usage: embr pkg [--registry <url>] <command> [args]")
+    print("commands:")
+    print("  install <name> [version]   install a package (default: latest)")
+    print("  list                       list installed packages")
+    print("  remove <name>              uninstall a package")
+    print("  versions <name>            list a package's available versions")
+    return 1
+end
+
+# pkg_main(argv: arr of str) -> num (process exit code: 0 ok, 1 error/usage)
+fn pkg_main(argv)
+    i = 0
+    registry = ""
+    rest = []
+    while i < len(argv)
+        if argv[i] == "--registry" and i + 1 < len(argv)
+            registry = argv[i + 1]
+            i = i + 2
+        else
+            rest = push(rest, argv[i])
+            i = i + 1
+        end
+    end
+    if registry != ""
+        pkg_configure({"registry_url": registry})
+    end
+
+    if len(rest) == 0
+        return __pkg_usage()
+    end
+
+    cmd = rest[0]
+    result = 0
+    try
+        if cmd == "install"
+            if len(rest) < 2
+                print("usage: embr pkg install <name> [version]")
+                result = 1
+            else
+                name = rest[1]
+                spec = "latest"
+                if len(rest) >= 3
+                    spec = rest[2]
+                end
+                info = pkg_install(name, spec)
+                print("installed " + name + "@" + info["version"] + " -> " + info["path"])
+            end
+        elif cmd == "list"
+            manifest = pkg_list()
+            names = keys(manifest)
+            if len(names) == 0
+                print("no packages installed")
+            else
+                for n in names
+                    entry = manifest[n]
+                    print(n + " " + entry["version"] + "  (" + entry["type"] + ", " + entry["path"] + ")")
+                end
+            end
+        elif cmd == "remove"
+            if len(rest) < 2
+                print("usage: embr pkg remove <name>")
+                result = 1
+            else
+                pkg_remove(rest[1])
+                print("removed " + rest[1])
+            end
+        elif cmd == "versions"
+            if len(rest) < 2
+                print("usage: embr pkg versions <name>")
+                result = 1
+            else
+                index = pkg_fetch_index()
+                for v in pkg_versions(index, rest[1])
+                    print(v)
+                end
+            end
+        else
+            __pkg_usage()
+            result = 1
+        end
+    catch e
+        print("pkg error: " + e["message"])
+        result = 1
+    end
+    return result
+end

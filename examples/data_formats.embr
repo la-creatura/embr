@@ -1,0 +1,30 @@
+# JSON and CSV round trips, plus encodings
+import "json"
+import "csv"
+import "encoding"
+import "embrlib"
+
+doc = json_parse("{\"name\": \"embr\", \"tags\": [\"small\", \"fast\"], \"version\": 1}")
+print(doc["name"])
+print(len(doc["tags"]))
+print(json_stringify([1, 2, {"ok": 1}]))
+print(json_stringify([1, [2, 3]], 2))
+
+# parse errors carry a line and column
+try
+    json_parse("{\n  \"a\": ?\n}")
+catch e
+    print(e["message"])
+end
+
+rows = csv_parse("name,score\nada,10\n\"smith, j\",7\n")
+print(rows[2][0])
+records = csv_parse_dicts("name,score\nada,10\nbob,7\n")
+print(records[1]["name"] + " scored " + records[1]["score"])
+print(csv_stringify([["a", 1], ["x,y", 2.5]]))
+
+print(base64_encode("hello embr"))
+print(base64_decode("aGVsbG8gZW1icg=="))
+print(hex_encode("hi"))
+print(sha256("abc"))
+print(crc32("123456789"))
