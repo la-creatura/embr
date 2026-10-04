@@ -1,7 +1,7 @@
 # uses the plugin built from examples/hello/hello.cpp -- see the writing-plugins wiki page
 import "hello"
 
-print(hello_greet("world"))
+print(hello_greet("wowwd"))
 print(hello_greet("embr", "Hi"))
 
 c = hello_counter()
